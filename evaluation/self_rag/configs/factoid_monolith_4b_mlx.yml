@@ -1,8 +1,4 @@
 name: "Self-RAG Monolith 4B — single call (factoid, MLX)"
-# Size-matched single-call control: identical to factoid_monolith_mlx.yml
-# (one structured grade+answer+check call) but on the 4B instead of the 9B.
-# Isolates model SIZE from topology in the monolith arm. Retrieval is held
-# fixed by reusing the 9B monolith's Chroma collection.
 pipelines:
   - name: Self-RAG Monolith 4B
     inputs: [0]
@@ -10,13 +6,12 @@ pipelines:
     dataset_stage_id: 0
     loadgen:
       component: loadgen.PoissonLoadScheduler
-      queue_depth: 50
-      max_queries: 10
-      timeout: 600000
+      queue_depth: 110
+      max_queries: 110
+      timeout: 4791
       config:
-        rate: 1.0
+        rate: 0.1167
     stages:
-      # --- Stage 0: Question DataLoader ---
       - name: Question dataloader
         id: 0
         outputs: [1]
@@ -29,8 +24,9 @@ pipelines:
             split: test
             question_column: question
             answers_column: answer
+            offset: 0
+            stride: 15
 
-      # --- Stage 1: ChromaDB Retriever ---
       - name: Document retriever
         id: 1
         outputs: [2]
@@ -43,10 +39,12 @@ pipelines:
             split: passages
             text_column: passage
             max_docs: 3200
-          top_k: 3
+          top_k: 5
+          embedding_model: intfloat/e5-base-v2
+          query_prefix: "query: "
+          passage_prefix: "passage: "
           collection_name: self_rag_factoid_monolith_corpus
 
-      # --- Stage 2: Monolith Prompt Formatter ---
       - name: Monolith formatter
         id: 2
         outputs: [3]
@@ -54,18 +52,17 @@ pipelines:
         config:
           tokenizer_stage_id: 3
 
-      # --- Stage 3: Monolith LLM (single 4B model) ---
       - name: Monolith LLM
         id: 3
         outputs: [4]
         component: stages.llm_mlx.Inference
         config:
           model:
-            name: mlx-community/Qwen3.5-4B-OptiQ-4bit
+            name: mlx-community/Qwen3.5-4B-bf16
             gen_kwargs:
               max_tokens: 256
+            thinking_budget: 1024
 
-      # --- Stage 4: Monolith Router (JSON parser + routing) ---
       - name: Monolith router
         id: 4
         outputs: [5, 6]
@@ -76,28 +73,27 @@ pipelines:
           end_stage_id: 5
           max_retries: 2
 
-      # --- Stage 5: End Stage (capture sidecar) ---
       - name: End stage
         id: 5
         component: stages.TerminalCapture
         polling_policy: utils.queues.polling.FirstSubmittedPolicy
 
-      # --- Stage 6: Query Rewrite Formatter ---
       - name: Query rewrite formatter
         id: 6
         outputs: [7]
         component: stages.self_rag.QuestionRewriterFormatter
         config:
           tokenizer_stage_id: 3
+          doc_chars: 1500
 
-      # --- Stage 7: Query Rewrite LLM (shares monolith model) ---
       - name: Query rewrite LLM
         id: 7
         outputs: [1]
         component: stages.llm_mlx.Inference
         config:
           model:
-            name: mlx-community/Qwen3.5-4B-OptiQ-4bit
+            name: mlx-community/Qwen3.5-4B-bf16
             gen_kwargs:
               max_tokens: 128
+            thinking_budget: 1024
           depends_on_id: 3

@@ -67,7 +67,6 @@ class TorchVisionDetection(Stage):
 
         self._model = get_component(model_cls)(**model_cfg)
 
-        # load from checkpoint file
         model_checkpoint_path = self.extra_config["model"].get(
             "model_checkpoint_path", None
         )

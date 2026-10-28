@@ -41,17 +41,14 @@ class MonolithRouter(Stage):
         # Strip markdown code fences if present
         if text.startswith("```"):
             lines = text.split("\n")
-            # Remove first and last lines (fences)
             lines = [l for l in lines if not l.strip().startswith("```")]
             text = "\n".join(lines).strip()
 
-        # Try direct parse
         try:
             return json.loads(text)
         except json.JSONDecodeError:
             pass
 
-        # Try to find JSON object in the text
         start = text.find("{")
         end = text.rfind("}")
         if start != -1 and end != -1 and end > start:
@@ -60,7 +57,6 @@ class MonolithRouter(Stage):
             except json.JSONDecodeError:
                 pass
 
-        # Fallback: couldn't parse, treat as failure
         print(f"MonolithRouter: failed to parse JSON from: {text[:200]}")
         return {}
 
@@ -79,37 +75,41 @@ class MonolithRouter(Stage):
 
         query_id = query.query_id
 
-        # Store the answer in context for potential use
+        # `best_answer` keeps the last non-empty answer across retries, so an
+        # exhausted query leaves with it, as in BinaryRouter.
         query.context["generated_answer"] = answer
         query.context["monolith_result"] = parsed
+        if answer:
+            query.context["best_answer"] = answer
 
         is_acceptable = (
             (relevance == "yes") and (hallucination == "no") and len(answer) > 0
         )
 
         if is_acceptable:
-            # Good answer — route to accept/end
             print(
                 f"MonolithRouter: query {query_id} accepted (relevance={relevance}, hallucination={hallucination})"
             )
             query.data = answer
             return {self._accept_stage_id: query}
         else:
-            # Not acceptable — check retry budget
             if query_id not in self._query_retries:
                 self._query_retries[query_id] = self._max_retries
 
             self._query_retries[query_id] -= 1
 
             if self._query_retries[query_id] < 0:
-                # Exhausted retries — send to end
                 print(f"MonolithRouter: query {query_id} exhausted retries, ending")
+                query.context["retries_exhausted"] = True
+                best = query.context.get("best_answer") or answer
                 query.data = (
-                    answer if answer else "Error: no satisfactory answer after retries"
+                    best if best else "Error: no satisfactory answer after retries"
                 )
                 return {self._end_stage_id: query}
             else:
-                # Retry via query rewriting
+                if answer:
+                    query.context["rejected_answer"] = answer
+                query.context["retries"] = query.context.get("retries", 0) + 1
                 print(
                     f"MonolithRouter: query {query_id} retry "
                     f"(remaining={self._query_retries[query_id]}, "

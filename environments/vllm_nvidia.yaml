@@ -1,0 +1,8 @@
+# vLLM server for stages.llm_server on NVIDIA. Kept separate from the framework
+# environment; point VLLM_EXECUTABLE at this environment's bin/vllm.
+name: gulliver_vllm
+dependencies:
+  - python=3.12.14
+  - pip
+  - pip:
+    - vllm==0.28.0

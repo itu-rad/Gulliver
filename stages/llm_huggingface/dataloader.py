@@ -43,9 +43,6 @@ class HuggingFaceDataLoader(Stage):
             k: v.to_iterable_dataset(num_shards=self._dataset_length[k])
             for (k, v) in self._datasets.items()
         }
-        # self._datasets = {k: v for (k, v) in self._datasets.items() if k in self._split}
-
-        # shuffle, if necessary
         if self.extra_config.get("shuffle", True):
             self._datasets = {k: v.shuffle() for (k, v) in self._datasets.items()}
 

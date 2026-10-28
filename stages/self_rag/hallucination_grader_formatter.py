@@ -1,4 +1,5 @@
 from stages.stage import Stage, log_phase
+from stages.self_rag.retrieval_grader_formatter import format_documents
 from utils.chat import apply_chat_template_safe
 from utils.schemas.query import Query
 
@@ -13,6 +14,7 @@ class HallucinationGraderFormatter(Stage):
         super().__init__(stage_config, pipeline_config)
 
         self._tokenizer_stage_id = self.extra_config["tokenizer_stage_id"]
+        self._enable_thinking = bool(self.extra_config.get("enable_thinking", True))
 
         self._tokenizer = None
 
@@ -28,6 +30,8 @@ class HallucinationGraderFormatter(Stage):
         """
 
         generated_answer = query.data
+        if isinstance(generated_answer, list):
+            generated_answer = generated_answer[0] if generated_answer else ""
         query.context["generated_answer"] = generated_answer
         retrieved_documents = query.context["retrieved_documents"]
 
@@ -41,7 +45,7 @@ class HallucinationGraderFormatter(Stage):
             },
             {
                 "role": "user",
-                "content": f"Set of facts: \n\n {retrieved_documents} \n\n LLM generation: {generated_answer}",
+                "content": f"Set of facts:\n{format_documents(retrieved_documents)}\n\nLLM generation: {generated_answer}",
             },
         ]
 
@@ -50,9 +54,8 @@ class HallucinationGraderFormatter(Stage):
             chat,
             tokenize=False,
             add_generation_prompt=True,
+            enable_thinking=self._enable_thinking,
         )
-
-        print("Final query", query)
 
         output = {idx: query for idx in self.output_queues}
         return output

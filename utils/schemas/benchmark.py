@@ -1,21 +1,8 @@
-import sys
-
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from typing import Literal
 from .pipeline import PipelineModel
 
 from radt.run.listeners import listeners as radt_listeners
-
-
-def _default_listeners() -> list[str]:
-    """OS-appropriate default RadT listeners.
-
-    macOS (Apple Silicon) only has macmon; NVIDIA/Linux hosts use the
-    smi/top/iostat/dcgmi set. A config can still override `listeners` explicitly.
-    """
-    if sys.platform == "darwin":
-        return ["macmon"]
-    return ["top", "smi", "iostat", "dcgmi"]
 
 
 class BenchmarkModel(BaseModel):
@@ -24,8 +11,11 @@ class BenchmarkModel(BaseModel):
     """
 
     pipelines: list[PipelineModel]
-    # Defaults by platform (see _default_listeners). Override per-config as needed.
-    listeners: list[Literal[tuple([x.lower() for x in radt_listeners.keys()])]] = Field(
-        default_factory=_default_listeners
-    )
+    # radT listeners to run; macmon covers Apple silicon, override on other hosts.
+    listeners: list[Literal[tuple([x.lower() for x in radt_listeners.keys()])]] = ["macmon"]
+    # How the pipelines share the GPU (each runs in its own process):
+    #   ""      time-sliced (default)
+    #   "mps"   radT starts the CUDA MPS control daemon for the group
+    #   "<n>g.<m>gb"  a MIG profile string, e.g. "1g.10gb"
+    collocation: str = ""
     name: str = "Unknown benchmark name"

@@ -1,16 +1,8 @@
-"""Faithful port of the MLPerf-Inference 3D-UNet / KiTS19 reference math.
+"""Port of the MLPerf-Inference 3D-UNet / KiTS19 reference math.
 
-Every constant and function here mirrors, line for line, the reference at
-`vision/medical_imaging/3d-unet-kits19` in mlcommons/inference (global_vars.py,
-preprocess.py, inference_utils.py, base_SUT.py). Keeping the math in one
-dependency-light module (numpy + scipy only; nibabel only at load time) lets the
-Choreo stages stay thin and lets the preprocessing/inference logic be unit-tested
-offline against a synthetic volume — no model or GPU required.
-
-The split into stages is deliberate: MLPerf times ONLY the sliding-window
-inference and excludes the resample/normalize/pad preprocessing. Choreo's thesis
-is end-to-end accounting, so `KiTS19Preprocess` runs that excluded work as a
-timed stage of the graph. This module is the shared implementation both use.
+Mirrors `vision/medical_imaging/3d-unet-kits19` in mlcommons/inference
+(global_vars.py, preprocess.py, inference_utils.py, base_SUT.py). Depends only
+on numpy and scipy; nibabel is needed only to load volumes.
 """
 
 from __future__ import annotations
@@ -167,5 +159,5 @@ def finalize(result, norm_map):
 
 
 def count_subvolumes(image, roi_shape=ROI_SHAPE, overlap=SLIDE_OVERLAP_FACTOR):
-    """Number of forward passes for a preprocessed volume (8–144 for KiTS19)."""
+    """Number of forward passes for a preprocessed volume."""
     return sum(1 for _ in get_slice_for_sliding_window(image, roi_shape, overlap))

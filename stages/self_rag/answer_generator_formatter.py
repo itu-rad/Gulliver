@@ -1,4 +1,6 @@
 from stages.stage import Stage, log_phase
+from stages.self_rag.prompt_style import SHORT_ANSWER_STYLE
+from stages.self_rag.retrieval_grader_formatter import format_documents
 from utils.chat import apply_chat_template_safe
 from utils.schemas.query import Query
 
@@ -13,6 +15,7 @@ class AnswerGeneratorFormatter(Stage):
         super().__init__(stage_config, pipeline_config)
 
         self._tokenizer_stage_id = self.extra_config["tokenizer_stage_id"]
+        self._enable_thinking = bool(self.extra_config.get("enable_thinking", True))
 
         self._tokenizer = None
 
@@ -33,14 +36,16 @@ class AnswerGeneratorFormatter(Stage):
         chat = [
             {
                 "role": "system",
-                "content": """
-                You are an answer rewriter. Given the retrieved documents and the original query, output an answer to the query supported by the retrieved documents. \n
-                Give a concise answer.
-                """,
+                "content": (
+                    "You are an answer generator. Given the retrieved documents "
+                    "and the original query, output an answer to the query "
+                    "supported by the retrieved documents.\n"
+                    + SHORT_ANSWER_STYLE
+                ),
             },
             {
                 "role": "user",
-                "content": f"User question: \n\n {orig_query} \n\n Retrieved documents: {retrieved_documents}",
+                "content": f"User question: {orig_query}\n\nRetrieved documents:\n{format_documents(retrieved_documents)}",
             },
         ]
 
@@ -49,9 +54,8 @@ class AnswerGeneratorFormatter(Stage):
             chat,
             tokenize=False,
             add_generation_prompt=True,
+            enable_thinking=self._enable_thinking,
         )
-
-        print("Final query", query)
 
         output = {idx: query for idx in self.output_queues}
         return output

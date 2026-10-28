@@ -1,0 +1,41 @@
+name: serial background alone (fp_serial_encode_1_cuda)
+listeners:
+- dcgmi
+- top
+pipelines:
+- name: BG encoder encode_1
+  inputs:
+  - 0
+  outputs:
+  - 1
+  dataset_stage_id: 0
+  loadgen:
+    component: loadgen.OfflineLoadScheduler
+    queue_depth: 1
+    max_queries: 1000000
+    timeout: 600
+    config:
+      rate: 0
+  stages:
+  - name: VQA dataloader
+    id: 0
+    outputs:
+    - 1
+    component: stages.multimodal_vqa.VQADataLoader
+    config:
+      dataset:
+        name: Multimodal-Fatima/OK-VQA_train
+        split: train
+        image_column: image
+        question_column: question
+        answers_column: answers
+        max_samples: 100
+      batch_size: 1
+  - name: CLIP vision encoder
+    id: 1
+    component: stages.multimodal_vqa.CLIPVisionEncoder
+    config:
+      model:
+        name: openai/clip-vit-large-patch14
+      device: cuda
+collocation: ''

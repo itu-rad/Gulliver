@@ -37,7 +37,6 @@ class TorchVisionPreprocessFromWeights(Stage):
     def run(self, query: Query) -> dict[int, Query]:
         batch = query.data
 
-        # process sample at a time and stack them
         preprocessed_inputs = []
         labels = []
         for [sample, label] in batch:

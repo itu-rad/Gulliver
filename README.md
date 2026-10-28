@@ -1,172 +1,92 @@
-# Collocation Benchmark
+# Gulliver
 
-The Collocation Benchmark is a modular and flexible framework designed to evaluate the end-to-end performance of (colocated) machine learning pipelines. The benchmark is built on the following core principles:
+Gulliver composes machine learning workloads into pipelines of stages, runs them end to end
+(data loading and preprocessing included) under a configurable load, and ties per-query
+traces to hardware metrics, also across collocated workloads. It runs on a single Linux or
+macOS machine, from Apple silicon laptops to NVIDIA servers.
 
-- **End-to-End Performance**: Quantifying performance across the entire pipeline, including data loading and preprocessing.
-- **Modularity**: Stages like data loading and model execution are standalone building blocks, allowing for flexible pipeline construction.
-- **Collocation**: Facilitating research into colocation schedulers and resource managers by providing scenarios with detailed time breakdowns for colocated workloads.
+- **Stages** wrap a unit of work: a data loader, a preprocessing step, model inference or
+  training, a retriever, a router. Each stage runs in its own thread and passes queries to
+  the next through queues, so pipelines can fan out, branch and loop.
+- **Pipelines** are declared in YAML: the stages, their parameters and how they connect.
+  Swapping a model, a backend or a whole stage is a config change.
+- **Load generators** drive a pipeline: synchronous (one query at a time) or Poisson arrivals.
+- **radT** runs each pipeline in its own process, sets up
+  collocation (e.g. NVIDIA MPS), and attaches hardware listeners such as `nvidia-smi`,
+  DCGM, Nsight or `macmon`. Results are recorded to MLflow.
 
-## Getting Started
-
-### Installation
-
-#### NVIDIA GPU-based systems
-
-1.  Clone the repository:
-    ```bash
-    git clone https://github.com/itu-rad/collocation-benchmark/
-    cd collocation-benchmark
-    ```
-
-2.  Install dependencies:
-    ```bash
-    conda env create -f environments/nvidia.yml
-    conda activate benchmark_nvidia
-    ```
-
-#### Apple Silicon-based systems
-
-1.  Clone the repository:
-    ```bash
-    git clone --recurse-submodules https://github.com/itu-rad/collocation-benchmark/
-    cd collocation-benchmark
-    ```
-
-2.  Install dependencies:
-    ```bash
-    conda env create -f environments/macos.yml
-    conda activate benchmark_macos
-    ```
-
-3.  Install ANEMLL (optional, only required for inference using Apple Neural Engine):
-    ```bash
-    cd stages/anemll/Anemll
-    VIRTUAL_ENV=<path_to_conda_env> ./install_dependencies.sh
-    ```
-
-### Usage
-
-To run the benchmark, use the `main.py` script with a configuration file:
+## Installation
 
 ```bash
-python main.py <path_to_config.yml>
+git clone <repository-url> gulliver && cd gulliver
+conda env create -f environments/nvidia.yaml   # or environments/macos.yaml on Apple silicon
+conda activate gulliver_nvidia                 # or gulliver_macos
+pip install "radt @ git+<radt-repository>@<commit>#subdirectory=radt"
 ```
 
-Example:
+LLM serving through `stages.llm_server` needs vLLM (`environments/vllm_nvidia.yaml`), vllm-metal
+or Ollama, installed separately; set `VLLM_EXECUTABLE` if `vllm` is not on `PATH`.
+
+## Usage
+
 ```bash
-python main.py pipeline_configs/finetune_huggingface.yml
+python main.py pipeline_configs/torchvision_inference.yml
 ```
 
-## Architecture
+runs every pipeline of the config through radT, each in its own process, with the listeners
+the config names. To run one pipeline in the current process instead:
 
-The benchmark consists of several modular components that work together to execute and measure ML pipelines.
-
-```mermaid
-sequenceDiagram
-    participant Benchmark
-    create participant LoadGen
-    Benchmark->>LoadGen: Build
-    create participant Logging
-    Benchmark->>Logging: Build
-    loop For each Pipeline
-        create participant Pipeline
-        Benchmark->>Pipeline: Build
-        loop For each Stage
-            create participant Stage
-            Pipeline->>Stage: Build
-        end
-        activate Benchmark
-        Benchmark->>+LoadGen: Start
-        LoadGen-->>Logging: Log start of the test
-        loop For each query
-            LoadGen->>+Pipeline: Invoke Pipeline execution
-            Pipeline-->>Logging: Log start of Pipeline execution
-            loop For each Stage
-                Pipeline-->>Logging: Log start of Stage execution
-                Pipeline->>+Stage: Invoke Stage
-                Stage->>-Pipeline: Return
-                Pipeline-->>Logging: Log end of Stage execution
-            end
-            Pipeline-->>Logging: Log end of Pipeline execution
-            Pipeline->>-LoadGen: Acknowledge finishing the query
-            LoadGen-->>Logging: Log end of the test
-        end
-        LoadGen->>-Benchmark: Return
-    end
+```bash
+python main.py <config> -p 0 [--label NAME] [--max-queries N]
 ```
 
-### Components
+Each run writes per-query CSV rows to `results/<label>.csv` (override the directory with
+`SUITE_OUTPUT_DIR`) and records parameters, spans and listener metrics to the MLflow server
+in `MLFLOW_TRACKING_URI` (experiment `-e`).
 
-- **Benchmark** (`main.py`): The entry point. It parses the configuration, initializes the global logger, and spawns processes for each pipeline's LoadGen.
-- **LoadGen** (`loadgen/`): Generates queries and submits them to the pipeline based on a scheduler (e.g., offline, poisson). It is agnostic to the specific workload.
-- **Pipeline** (`pipeline/`): Orchestrates a sequence of Stages. It manages communication between stages and logs execution times.
-- **Stage** (`stages/`): The fundamental building block. A stage performs a specific task (e.g., DataLoader, Inference, Finetuning).
-- **Logging** (`utils/logger.py`): Asynchronously records performance metrics to minimize interference with execution.
-
-## Configuration
-
-The benchmark is configured via YAML files. A configuration defines the pipelines, their stages, and the load generation policy.
-
-### Structure
-
-See `pipeline_configs/` for examples. A typical config includes:
+A config:
 
 ```yaml
-name: "benchmark_run_name"
+name: "Image classification"
+listeners: [smi, top]
 pipelines:
-  - name: "Pipeline Name"
-    inputs: [0] # IDs of input stages
-    outputs: [1] # IDs of output stages
+  - name: "Inference"
+    inputs: [0]
+    outputs: [2]
     dataset_stage_id: 0
     loadgen:
-      component: loadgen.OfflineLoadScheduler
+      component: loadgen.PoissonLoadScheduler
       queue_depth: 10
       max_queries: 100
+      timeout: 600
       config:
-        rate: 5 # requests/sec
+        rate: 5            # queries per second
     stages:
-      - name: "Stage 1 (e.g., DataLoader)"
+      - name: Data loader
         id: 0
         outputs: [1]
-        component: stages.package.ClassName
-        config:
-            # Stage-specific configuration
-            batch_size: 8
-            ...
-      - name: "Stage 2 (e.g., Model)"
+        component: stages.torchvision_classification.TorchVisionDataLoader
+        config: {...}
+      - name: Model
         id: 1
-        component: stages.package.ClassName
-        config:
-            model_name: "..."
-            ...
+        outputs: [2]
+        component: stages.torchvision_classification.TorchVisionClassification
+        config: {...}
+      - name: End
+        id: 2
+        component: stages.TerminalCapture
 ```
 
-## Supported Stages
+`pipeline_configs/` has working examples: TorchVision training and inference, LLM generation
+and fine-tuning with Hugging Face, torchtune and MLX, RAG serving in-process or
+through vLLM/Ollama, multimodal VQA, and MLPerf-style workloads. Several pipelines in one
+config run concurrently; `collocation: mps` runs them under NVIDIA MPS.
+`python scripts/render_pipeline_graph.py <config>` draws a config's graph.
 
-The benchmark currently supports the following families of stages:
+See [docs/](docs/README.md) for the configuration reference, the component library,
+tracing, and how to add stages, schedulers and polling policies.
 
-- **LLM HuggingFace** (`stages/llm_huggingface`):
-    - `HuggingFaceDataLoader`: Loads text datasets.
-    - `Finetune`: Instruction tuning using PEFT/LoRA.
-    - `Inference`: Text generation.
-- **LLM Torchtune** (`stages/llm_torchtune`):
-    - Implementation of finetuning and generation using PyTorch Tune.
-- **Self RAG** (`stages/self_rag`):
-    - Retrieval-Augmented Generation workflows.
-- **Vision** (`stages/torchvision_classification`):
-    - Standard computer vision classification tasks.
+## Reproducing the paper
 
-## Extensibility
-
-### Adding a New Stage
-
-1.  Create a new directory in `stages/`.
-2.  Inherit from the base `Stage` class (`stages/stage.py`).
-3.  Implement the `run` method and initialization logic.
-4.  Register your component path in the YAML config (e.g., `stages.my_new_stage.MyStage`).
-
-### Adding a Scheduler
-
-1.  Add a new scheduler class in `loadgen/schedulers/`.
-2.  Inherit from the base `LoadScheduler`.
-3.  Implement the generation logic.
+[evaluation/](evaluation/README.md) holds the configs and collection scripts for every
+measurement in the paper.

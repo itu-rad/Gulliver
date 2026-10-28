@@ -1,27 +1,7 @@
-"""Automated verifier for MLflow + Perfetto tracing.
+"""Verify MLflow tracing on a noop pipeline (span counts, flow chains, ordering).
 
-Runs a tiny noop pipeline, then fetches the resulting MLflow trace spans
-from Postgres (same code path as ``utils/export_trace.py``) and asserts
-structural invariants:
-
-* expected span counts per query × stage
-* flow-id chain unbroken from scheduler → pipeline → each stage → pipeline-exit
-* every span has a populated thread_id attribute
-* required attributes present per span type
-* monotonic temporal order per query along the flow chain
-
-Two modes:
-
-* ``--mode executor`` — calls ``run_loadgen`` directly inside an
-  ``mlflow.start_run``. Fast inner loop, doesn't exercise the RadT
-  subprocess path. Default.
-
-* ``--mode radt`` — invokes ``python main.py <config>`` as a subprocess.
-  Lets RadT spawn the executor child. Verifies the flush hardening
-  survives subprocess teardown.
-
-Exit code: 0 if all assertions pass, 1 otherwise. Detailed JSON report
-goes to stdout; human summary to stderr.
+``--mode executor`` runs the pipeline in-process; ``--mode radt`` runs it via
+main.py. Exits 0 if all checks pass; JSON report on stdout, summary on stderr.
 """
 
 from __future__ import annotations
@@ -38,7 +18,7 @@ from collections import defaultdict
 from dataclasses import dataclass, asdict, field
 from typing import Any, Optional
 
-# Ensure project root is on sys.path so we can import the framework.
+# Make the framework importable.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
@@ -67,8 +47,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--experiment",
         type=int,
-        default=138,
-        help="RadT experiment id (default 138, matches project convention).",
+        required=True,
+        help="radT/MLflow experiment id.",
     )
     parser.add_argument(
         "--keep-config",
@@ -160,16 +140,9 @@ def _finalize_verifier_parent_run(
 ) -> int:
     """Mark the RadT parent run for this verifier invocation FINISHED.
 
-    Background: RadT opens the parent run via ``with mlflow.start_run`` in
-    ``schedule_external``. Normally the context manager closes it on exit,
-    but the verifier kills main.py at 180s via SIGKILL — which bypasses
-    every cleanup path. The parent then stays in RUNNING state forever.
-
-    This sweep targets ONLY the verifier's own parent run:
-    * created after ``started_at_ms`` (only this invocation)
-    * name starts with ``verify_tracing_`` AND does not start with
-      ``(0 0) `` (so we never touch the pipeline child run, whose spans
-      may still be uploading).
+    Needed when main.py is killed on timeout and the parent run stays RUNNING.
+    Only runs started after ``started_at_ms`` whose name starts with
+    ``verify_tracing_`` are touched, never the ``(0 0) `` pipeline child run.
 
     Returns the number of runs finalized.
     """
@@ -209,13 +182,11 @@ def _finalize_verifier_parent_run(
 def _run_radt_mode(config_path: str, experiment_id: int) -> list[str]:
     """Run via main.py + RadT, return list of MLflow run_ids spawned.
 
-    RadT spawns one MLflow run per pipeline. For the depth-N noop config
-    we expect exactly one.
+    radT spawns one MLflow run per pipeline; the noop config has one pipeline.
     """
     env = os.environ.copy()
-    # Mark the experiment timestamp so we can find the new runs after the fact.
     marker = f"verify_tracing_{int(time.time())}"
-    env["CHOREO_VERIFY_MARKER"] = marker
+    env["SUITE_VERIFY_MARKER"] = marker
 
     cmd = [
         sys.executable,
@@ -226,9 +197,7 @@ def _run_radt_mode(config_path: str, experiment_id: int) -> list[str]:
     ]
     print(f"[verify_tracing] running: {' '.join(cmd)}", file=sys.stderr, flush=True)
     started_at = time.time()
-    # Defensive timeout: a small noop pipeline should complete well within 3 min.
-    # If main.py hangs (the historical pattern), we kill it and proceed to
-    # verify whatever child runs landed in MLflow.
+    # If main.py hangs, kill it and verify whatever child runs landed in MLflow.
     try:
         proc = subprocess.run(cmd, env=env, cwd=_REPO_ROOT, check=False, timeout=180)
         if proc.returncode != 0:
@@ -244,9 +213,6 @@ def _run_radt_mode(config_path: str, experiment_id: int) -> list[str]:
             flush=True,
         )
 
-    # The verifier kills main.py before RadT's parent-run context manager
-    # can fire, leaving the parent in RUNNING state. Finalize it externally
-    # (parent only — child runs may still be uploading).
     _finalize_verifier_parent_run(experiment_id, int(started_at * 1000))
 
     # Find runs created since started_at.
@@ -273,10 +239,8 @@ def _run_radt_mode(config_path: str, experiment_id: int) -> list[str]:
 def _retrieve_spans_for_run(run_id: str, max_attempts: int = 5, delay: float = 1.0):
     """Pull spans from Postgres with a short retry budget.
 
-    Separates "flush bug" (spans never arrive) from "Postgres replication lag"
-    (spans arrive a tick after LoadGen.run returns). If max_attempts elapse
-    with no spans, return an empty DataFrame so the assertions can report
-    the failure clearly rather than silently retrying forever.
+    Tolerates spans arriving shortly after the run ends. Returns an empty
+    DataFrame if none arrive, so the checks report the failure.
     """
     from utils.export_trace import explode_spans_content, retrieve_spans  # pylint: disable=import-outside-toplevel
 
@@ -570,10 +534,7 @@ def main() -> int:
         any_failed = False
         for run_id in run_ids:
             spans_df = _retrieve_spans_for_run(run_id)
-            # Under RadT, the orchestrator opens a parent run for bookkeeping
-            # (listeners, the schedule artifact) but the pipeline subprocess
-            # is the one that emits spans. Treat zero-span runs as "not a
-            # pipeline run" rather than a failure.
+            # Under radT the parent run has no spans; skip it rather than fail.
             if args.mode == "radt" and (spans_df is None or spans_df.empty):
                 skipped.append(run_id)
                 continue
@@ -582,8 +543,7 @@ def main() -> int:
             if not rep.passed:
                 any_failed = True
 
-        # In radt mode we need at least one pipeline run with spans to call
-        # the verifier green. (In executor mode, every run_id is the pipeline.)
+        # In radt mode at least one pipeline run must have spans.
         if args.mode == "radt" and not all_reports:
             print(
                 f"[verify_tracing] FAIL: no pipeline runs with spans found "
@@ -603,7 +563,7 @@ def main() -> int:
                 print(f"  [{marker}] {c.name}: {c.detail}", file=sys.stderr)
             print(f"  --> overall: {'PASS' if rep.passed else 'FAIL'}", file=sys.stderr)
 
-        # JSON stdout — for programmatic consumption by iterative dev loop.
+        # JSON report for programmatic use.
         out = {
             "mode": args.mode,
             "queries": args.queries,

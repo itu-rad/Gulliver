@@ -1,4 +1,5 @@
 from stages.stage import Stage, log_phase
+from stages.self_rag.prompt_style import SHORT_ANSWER_STYLE
 from utils.chat import apply_chat_template_safe
 from utils.schemas.query import Query
 
@@ -22,6 +23,10 @@ class MonolithFormatter(Stage):
         super().__init__(stage_config, pipeline_config)
 
         self._tokenizer_stage_id = self.extra_config["tokenizer_stage_id"]
+        self._enable_thinking = bool(self.extra_config.get("enable_thinking", True))
+        # always_answer: always produce an answer, as the decomposed generator
+        # does; False lets the model return an empty answer when not relevant.
+        self._always_answer = bool(self.extra_config.get("always_answer", True))
         self._tokenizer = None
 
     @log_phase
@@ -36,7 +41,6 @@ class MonolithFormatter(Stage):
         retrieved_documents = query.context.get("retrieved_documents", [])
         orig_query = query.context["original_query"]
 
-        # Format documents as a single string
         if isinstance(retrieved_documents, list):
             docs_text = "\n\n".join(
                 f"Document {i+1}: {doc}" for i, doc in enumerate(retrieved_documents)
@@ -53,9 +57,14 @@ class MonolithFormatter(Stage):
                     "following steps in a single response:\n\n"
                     "1. **Relevance Grading:** Assess whether the retrieved "
                     "documents are relevant to the user question.\n"
-                    "2. **Answer Generation:** If relevant, generate a concise "
-                    "answer grounded in the retrieved documents. If not relevant, "
-                    "set the answer to an empty string.\n"
+                    "2. **Answer Generation:** "
+                    + ("Generate your best answer to the question, grounded in "
+                       "the retrieved documents where they support it. "
+                       if self._always_answer else
+                       "If relevant, generate an answer grounded in the "
+                       "retrieved documents. If not relevant, set the answer "
+                       "to an empty string. ")
+                    + SHORT_ANSWER_STYLE + "\n"
                     "3. **Hallucination Check:** Verify whether your generated "
                     "answer is fully supported by the retrieved documents.\n\n"
                     "Output your response as a JSON object with exactly these "
@@ -82,6 +91,7 @@ class MonolithFormatter(Stage):
             chat,
             tokenize=False,
             add_generation_prompt=True,
+            enable_thinking=self._enable_thinking,
         )
 
         output = {idx: query for idx in self.output_queues}

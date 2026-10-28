@@ -25,7 +25,6 @@ class ChromaRetriever(Stage):
     def __init__(self, stage_config, pipeline_config):
         super().__init__(stage_config, pipeline_config)
 
-        # Corpus dataset configuration
         corpus_config = self.extra_config["corpus_dataset"]
         self._corpus_dataset_name = corpus_config["name"]
         self._corpus_subset = corpus_config.get("subset", None)
@@ -34,19 +33,30 @@ class ChromaRetriever(Stage):
         self._corpus_max_docs = corpus_config.get("max_docs", 5000)
 
         # Optional: build the corpus from a HotpotQA-style nested context
-        # field (gold + distractor passages shipped with each question)
-        # instead of a flat text column. Enables multi-hop datasets whose
-        # supporting passages aren't in a standalone corpus.
+        # field (passages shipped with each question) instead of a flat
+        # text column.
         self._corpus_context_column = corpus_config.get("context_column", None)
         self._corpus_max_context_rows = corpus_config.get(
             "max_context_rows", self._corpus_max_docs
         )
+        # Rows that contribute their context; must match the question
+        # loader's offset/stride.
+        self._corpus_context_offset = int(corpus_config.get("context_row_offset", 0))
+        self._corpus_context_stride = int(corpus_config.get("context_row_stride", 1))
 
-        # Retrieval configuration
         self._top_k = self.extra_config.get("top_k", 3)
         self._collection_name = self.extra_config.get(
             "collection_name", "self_rag_corpus"
         )
+
+        # Optional sentence-transformer embedder instead of ChromaDB's default.
+        # Embeddings are computed here so asymmetric query/passage prefixes
+        # (e5-style models) can be applied, which ChromaDB's built-in
+        # embedding function cannot do.
+        self._embedding_model_name = self.extra_config.get("embedding_model", None)
+        self._query_prefix = self.extra_config.get("query_prefix", "")
+        self._passage_prefix = self.extra_config.get("passage_prefix", "")
+        self._embedder = None
 
         self._collection = None
         self._client = None
@@ -59,12 +69,20 @@ class ChromaRetriever(Stage):
         into a ``"title\\n<joined sentences>"`` passage and dedup across rows
         so the gold supporting passages sit alongside many distractors.
         """
-        n_rows = min(len(raw_dataset), self._corpus_max_context_rows)
+        rows = range(
+            self._corpus_context_offset, len(raw_dataset), self._corpus_context_stride
+        )[: self._corpus_max_context_rows]
         seen: set[str] = set()
         documents: list[str] = []
-        for i in range(n_rows):
+        for i in rows:
             meta = raw_dataset[i][self._corpus_context_column]
-            ctx = meta.get("context") if isinstance(meta, dict) else None
+            # Two layouts: FlashRAG nests it as metadata["context"]; hotpot_qa
+            # (`distractor` config) stores the {"title", "sentences"} dict
+            # directly in the `context` column.
+            if isinstance(meta, dict) and "title" in meta and "sentences" in meta:
+                ctx = meta
+            else:
+                ctx = meta.get("context") if isinstance(meta, dict) else None
             if not ctx:
                 continue
             titles = ctx.get("title", [])
@@ -93,11 +111,10 @@ class ChromaRetriever(Stage):
         else:
             raw_dataset = load_dataset(self._corpus_dataset_name)[self._corpus_split]
 
-        # Limit corpus size
-        if len(raw_dataset) > self._corpus_max_docs:
+        # Flat corpora only; context corpora select rows by offset/stride.
+        if not self._corpus_context_column and len(raw_dataset) > self._corpus_max_docs:
             raw_dataset = raw_dataset.select(range(self._corpus_max_docs))
 
-        # Extract text documents and filter out empty entries
         if self._corpus_context_column:
             documents = self._build_context_corpus(raw_dataset)
         else:
@@ -109,18 +126,40 @@ class ChromaRetriever(Stage):
 
         print(f"ChromaRetriever: indexing {len(documents)} documents into ChromaDB")
 
-        # Create in-memory ChromaDB client and collection
         self._client = chromadb.Client()
         self._collection = self._client.create_collection(
             name=self._collection_name,
         )
 
-        # Add documents in batches (ChromaDB requires unique IDs)
+        passage_embs = None
+        if self._embedding_model_name:
+            from sentence_transformers import SentenceTransformer
+
+            print(
+                f"ChromaRetriever: embedding corpus with "
+                f"{self._embedding_model_name} (prefix={self._passage_prefix!r})"
+            )
+            self._embedder = SentenceTransformer(self._embedding_model_name)
+            passage_embs = self._embedder.encode(
+                [self._passage_prefix + d for d in documents],
+                batch_size=64,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            )
+
+        # ChromaDB requires unique ids.
         batch_size = 500
         for i in range(0, len(documents), batch_size):
             batch = documents[i : i + batch_size]
             ids = [f"doc_{j}" for j in range(i, i + len(batch))]
-            self._collection.add(documents=batch, ids=ids)
+            if passage_embs is not None:
+                self._collection.add(
+                    documents=batch,
+                    embeddings=passage_embs[i : i + len(batch)].tolist(),
+                    ids=ids,
+                )
+            else:
+                self._collection.add(documents=batch, ids=ids)
 
         print(
             f"ChromaRetriever: indexed {self._collection.count()} documents, "
@@ -130,26 +169,32 @@ class ChromaRetriever(Stage):
     def run(self, query: Query) -> dict[int, Query]:
         """Retrieve top_k documents for the incoming query."""
 
-        # Handle both string and list inputs. On a retry loop-back the query
-        # rewriter sends a follow-up ("bridge") query in query.data; use it
-        # for retrieval but do NOT overwrite original_query — downstream
-        # grading/answering must stay anchored to the user's true question
-        # (kept stable in context["question"] by the dataloader).
+        # On a retry, query.data holds the rewriter's follow-up query. It is
+        # used for retrieval only; the user's question stays in the context.
         question = query.data
         if isinstance(question, list):
             question = question[0]
         query.context.pop("is_retry", None)
 
-        # Query ChromaDB
-        results = self._collection.query(
-            query_texts=[question],
-            n_results=self._top_k,
-        )
+        if self._embedder is not None:
+            q_emb = self._embedder.encode(
+                [self._query_prefix + question],
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            )
+            results = self._collection.query(
+                query_embeddings=q_emb.tolist(),
+                n_results=self._top_k,
+            )
+        else:
+            results = self._collection.query(
+                query_texts=[question],
+                n_results=self._top_k,
+            )
         new_docs = results["documents"][0] if results["documents"] else []
 
-        # Accumulate evidence across hops (dedup, preserve order) so the answer
-        # stage sees documents gathered from every hop, not just the latest —
-        # required for multi-hop questions whose answer spans several passages.
+        # Accumulate documents across hops (deduplicated, in order), so
+        # multi-hop answers can draw on every hop.
         accumulated = list(query.context.get("retrieved_documents", []) or [])
         seen = set(accumulated)
         for doc in new_docs:

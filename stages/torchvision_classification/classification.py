@@ -83,17 +83,15 @@ class TorchVisionClassification(Stage):
         replace_classifier = self.extra_config["model"].get("replace_classifier", False)
         *_, last_module = self._model.named_modules()
         if replace_classifier:
-            # get the last module of the model and replace it
             self._replace_last_module(last_module)
 
-        # load from checkpoint file
         model_checkpoint_path = self.extra_config["model"].get(
             "model_checkpoint_path", None
         )
         if model_checkpoint_path:
             self._model.load_state_dict(torch.load(model_checkpoint_path))
 
-        # set only subset of the weights as trainable parameter (transfer learning)
+        # Transfer learning: freeze everything, then unfreeze the last module.
         for param in self._model.parameters():
             param.requires_grad = False
 
@@ -137,31 +135,22 @@ class TorchVisionClassification(Stage):
             self._model.train()
 
         with torch.set_grad_enabled(query.split == "train"):
-            # Only the training path has (and needs) an optimizer; guarding here
-            # avoids an AttributeError on inference configs that omit `optimizer`
-            # (e.g. mlperf/resnet_inference.yml) and a wasted zero_grad on val.
+            # Inference configs may omit `optimizer`.
             if query.split == "train" and self._optimizer is not None:
                 self._optimizer.zero_grad()
 
             outputs = self._model(inputs)
-
-            # preds = torch.argmax(outputs, dim=1)
-
-            # print(f"Predictions: {preds}, Labels: {labels}")
 
             if query.split == "train":
                 loss = self._criterion(outputs, labels)
                 loss.backward()
                 self._optimizer.step()
 
-        # Synchronize GPU to ensure timing captures actual hardware execution
+        # Synchronize so the stage's timing includes the device work.
         if self._device.type == "mps":
             torch.mps.synchronize()
         elif self._device.type == "cuda":
             torch.cuda.synchronize()
 
-        # query.data = [
-        #     pred == label for pred, label in zip(preds.tolist(), labels.tolist())
-        # ]
         output = {idx: query for idx in self.output_queues}
         return output

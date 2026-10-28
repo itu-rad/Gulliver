@@ -1,0 +1,46 @@
+diff --git a/vision/medical_imaging/3d-unet-kits19/accuracy_kits.py b/vision/medical_imaging/3d-unet-kits19/accuracy_kits.py
+index 1beb601..1de7a4f 100644
+--- a/vision/medical_imaging/3d-unet-kits19/accuracy_kits.py
++++ b/vision/medical_imaging/3d-unet-kits19/accuracy_kits.py
+@@ -208,10 +208,9 @@ def save_evaluation_summary(postprocessed_data_dir, dice_scores):
+         kidney = arr[0]
+         tumor = arr[1]
+         composite = np.mean(arr)
+-        df = df.append(
+-            {"case": case, "kidney": kidney, "tumor": tumor, "composite": composite},
+-            ignore_index=True,
+-        )
++        df = pd.concat([df, pd.DataFrame([
++            {"case": case, "kidney": kidney, "tumor": tumor, "composite": composite}
++        ])], ignore_index=True)
+ 
+     df.set_index("case", inplace=True)
+     # consider NaN as a crash hence zero
+diff --git a/vision/medical_imaging/3d-unet-kits19/inference_utils.py b/vision/medical_imaging/3d-unet-kits19/inference_utils.py
+index 4514c70..2b3cd0e 100644
+--- a/vision/medical_imaging/3d-unet-kits19/inference_utils.py
++++ b/vision/medical_imaging/3d-unet-kits19/inference_utils.py
+@@ -52,7 +52,7 @@ def gaussian_kernel(n, std):
+     """
+     Returns gaussian kernel; std is standard deviation and n is number of points
+     """
+-    gaussian1D = signal.gaussian(n, std)
++    gaussian1D = signal.windows.gaussian(n, std)
+     gaussian2D = np.outer(gaussian1D, gaussian1D)
+     gaussian3D = np.outer(gaussian2D, gaussian1D)
+     gaussian3D = gaussian3D.reshape(n, n, n)
+diff --git a/vision/medical_imaging/3d-unet-kits19/run.py b/vision/medical_imaging/3d-unet-kits19/run.py
+index 9d48f99..8d73d21 100644
+--- a/vision/medical_imaging/3d-unet-kits19/run.py
++++ b/vision/medical_imaging/3d-unet-kits19/run.py
+@@ -154,8 +154,8 @@ def main():
+     # setup LoadGen
+     settings = lg.TestSettings()
+     settings.scenario = scenario_map[args.scenario]
+-    settings.FromConfig(args.mlperf_conf, "3d-unet", args.scenario)
+-    settings.FromConfig(args.user_conf, "3d-unet", args.scenario)
++    # loadgen 6.x bundles mlperf.conf internally; load ONLY user.conf with conf_type=1
++    settings.FromConfig(args.user_conf, "3d-unet", args.scenario, 1)
+     if args.accuracy:
+         settings.mode = lg.TestMode.AccuracyOnly
+     else:

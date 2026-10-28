@@ -2,9 +2,7 @@
 
 Drop-in replacement for the identity `Stage` used at pipeline tails.
 Writes one JSONL record per completed query to
-`evaluation/results/<pipeline_name>_outputs.jsonl`, then forwards the
-query unchanged. The receiving pipeline.retrieve_results() sees no
-difference; the timing CSV is unaffected.
+`results/<pipeline_name>_outputs.jsonl`, then forwards the query unchanged.
 
 YAML:
     - name: End stage
@@ -23,7 +21,7 @@ from stages.stage import Stage
 from utils.schemas import Query
 
 
-_DEFAULT_OUTPUT_DIR = "evaluation/results"
+_DEFAULT_OUTPUT_DIR = os.environ.get("SUITE_OUTPUT_DIR", "results")
 
 
 def _serializable(value):
@@ -44,15 +42,14 @@ class TerminalCapture(Stage):
         super().__init__(stage_config, pipeline_config)
 
         default_label = pipeline_config.name.replace(" ", "_").lower()
-        # Honour an env var so a CLI --label override on main.py keeps the
-        # JSONL filename in sync with the timing CSV.
-        pipeline_name = os.environ.get("CHOREO_OUTPUT_LABEL", default_label)
+        # Set by main.py from --label, so the JSONL name matches the timing CSV.
+        pipeline_name = os.environ.get("SUITE_OUTPUT_LABEL", default_label)
         output_dir = self.extra_config.get("output_dir", _DEFAULT_OUTPUT_DIR)
         self._output_path = os.path.join(
             output_dir, f"{pipeline_name}_outputs.jsonl"
         )
         os.makedirs(output_dir, exist_ok=True)
-        # Truncate at construction so a fresh run doesn't append to stale data.
+        # Truncate so a new run does not append to stale data.
         open(self._output_path, "w").close()
         self._write_lock = Lock()
 
@@ -72,6 +69,10 @@ class TerminalCapture(Stage):
             ),
             "generated_answer": _serializable(ctx.get("generated_answer")),
             "final_data": _serializable(query.data),
+            "retries": ctx.get("retries", 0),
+            "retries_exhausted": bool(ctx.get("retries_exhausted", False)),
+            "llm_calls": _serializable(ctx.get("llm_calls")),
+            "reasoning_tokens": _serializable(ctx.get("reasoning_tokens")),
         }
         with self._write_lock:
             with open(self._output_path, "a", encoding="utf-8") as fh:

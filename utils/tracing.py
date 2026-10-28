@@ -1,22 +1,7 @@
-"""Helpers for MLflow tracing flush handling.
+"""MLflow trace export configuration and flushing.
 
-Why this module exists: ``main.py:radt_entrypoint`` and ``main.py:main``
-both call ``os._exit(0)`` on completion to skip Python interpreter
-shutdown (which hangs for minutes on the MLflow HTTPS socket in
-CLOSE_WAIT). ``os._exit`` also skips atexit handlers and MLflow's
-background async-logging threads — so any spans / metrics still in flight
-when we hit ``os._exit`` are lost.
-
-Two functions:
-
-* ``configure_sync_export`` — call ONCE per process before the first
-  ``mlflow.start_span``. Switches trace export from the default async
-  queue to synchronous, so spans hit the backend at span-close time
-  rather than via a background worker.
-
-* ``flush_traces`` — call right before ``os._exit`` (and from the
-  SIGTERM handler). Drains both the run-level async logger (params,
-  metrics, artifacts) and the trace async logger (spans).
+The entry points exit with ``os._exit``, which skips atexit handlers, so
+``flush_traces`` must be called before exiting or in-flight spans are lost.
 """
 
 from __future__ import annotations
@@ -25,9 +10,8 @@ import os
 import sys
 
 
-# Env var read by MLflow's tracing exporter at initialization. Set BEFORE
-# any mlflow.start_span call — once the exporter is constructed the flag
-# is frozen for the process lifetime.
+# Read by MLflow's tracing exporter at initialization; must be set before
+# the first span is created.
 _ASYNC_TRACE_ENV_VAR = "MLFLOW_ENABLE_ASYNC_TRACE_LOGGING"
 
 
@@ -42,16 +26,10 @@ def configure_sync_export() -> None:
 
 
 def configure_async_export() -> None:
-    """Enable MLflow async trace export (radt AsyncTraceExportQueueV2 path).
+    """Enable MLflow async trace export (used by radT's batched uploader).
 
-    The pinned radt (feat/Sipondo/async_tracing @9dda7b8) monkey-patches
-    mlflow's AsyncTraceExportQueue at import time with a bounded,
-    drop-on-overflow, background-batched uploader — but mlflow only USES
-    the async queue when this flag is truthy (OSS backends default to
-    sync export, which blocks worker threads per root span; probe-measured
-    to destroy open-loop arrival processes against a remote tracking
-    server). Idempotent; call once per process before any
-    ``mlflow.start_span``.
+    Sync export blocks worker threads on every root span. Idempotent; call
+    once per process before any ``mlflow.start_span``.
     """
     # setdefault: an explicit user override in the shell wins.
     os.environ.setdefault(_ASYNC_TRACE_ENV_VAR, "true")
@@ -71,18 +49,15 @@ def flush_traces() -> None:
               file=sys.stderr, flush=True)
         return
 
-    # 1) Drain MLflow run-level async logger (params, metrics, artifacts).
+    # Run-level async logger (params, metrics, artifacts).
     try:
         mlflow.flush_async_logging()
     except Exception as exc:  # pylint: disable=broad-except
         print(f"[tracing] flush_async_logging failed: {exc}",
               file=sys.stderr, flush=True)
 
-    # 2) Drain MLflow trace async logger (spans). Only meaningful when async
-    # export is on — in sync mode (our default, see configure_sync_export)
-    # spans are already exported at span-close and there's no queue.
-    # Calling it anyway in sync mode causes MLflow to log a noisy
-    # "'MlflowV3SpanExporter' object has no attribute '_async_queue'" error.
+    # Trace async logger (spans). Skipped in sync mode, where there is no
+    # queue and MLflow would log a spurious error.
     if os.environ.get(_ASYNC_TRACE_ENV_VAR, "true").lower() != "false":
         try:
             mlflow.flush_trace_async_logging(terminate=True)

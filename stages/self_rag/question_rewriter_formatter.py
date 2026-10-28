@@ -13,6 +13,9 @@ class QuestionRewriterFormatter(Stage):
         super().__init__(stage_config, pipeline_config)
 
         self._tokenizer_stage_id = self.extra_config["tokenizer_stage_id"]
+        # Characters of each gathered document shown to the rewriter.
+        self._doc_chars = int(self.extra_config.get("doc_chars", 1500))
+        self._enable_thinking = bool(self.extra_config.get("enable_thinking", True))
 
         self._tokenizer = None
 
@@ -28,23 +31,33 @@ class QuestionRewriterFormatter(Stage):
         """
 
         print("QuestionRewriterFormatter: ", query)
-        # Anchor on the user's true question (stable), not original_query which
-        # could in principle be mutated by upstream stages.
+        # Prefer the user's question; original_query may be changed upstream.
         orig_query = query.context.get("question") or query.context["original_query"]
 
-        # Condition the rewrite on the evidence gathered so far so it can issue
-        # a *follow-up* (bridge) query for multi-hop questions, rather than just
-        # paraphrasing the same question and re-retrieving the same documents.
+        # Condition on the evidence so far, so multi-hop questions get a
+        # follow-up query instead of a paraphrase.
         docs = query.context.get("retrieved_documents", []) or []
         if isinstance(docs, list):
             docs_text = (
                 "\n\n".join(
-                    f"Document {i+1}: {str(d)[:400]}" for i, d in enumerate(docs)
+                    f"Document {i+1}: {str(d)[:self._doc_chars]}"
+                    for i, d in enumerate(docs)
                 )
                 or "(no documents retrieved yet)"
             )
         else:
-            docs_text = str(docs)[:2000]
+            docs_text = str(docs)[: self._doc_chars * 5]
+
+        # A retry from the hallucination grader carries the rejected answer;
+        # including it makes the retry prompt differ from the previous one.
+        rejected = query.context.get("rejected_answer")
+        if isinstance(rejected, list):
+            rejected = rejected[0] if rejected else None
+        rejected_text = (
+            f"\n\nA previous answer, \"{rejected}\", was judged NOT supported by "
+            "these documents; find evidence that settles the question instead."
+            if rejected else ""
+        )
 
         chat = [
             {
@@ -65,7 +78,8 @@ class QuestionRewriterFormatter(Stage):
                 "role": "user",
                 "content": (
                     f"Question: {orig_query}\n\n"
-                    f"Documents retrieved so far:\n{docs_text}\n\n"
+                    f"Documents retrieved so far:\n{docs_text}"
+                    f"{rejected_text}\n\n"
                     f"Next search query:"
                 ),
             },
@@ -76,6 +90,7 @@ class QuestionRewriterFormatter(Stage):
             chat,
             tokenize=False,
             add_generation_prompt=True,
+            enable_thinking=self._enable_thinking,
         )
 
         query.context["is_retry"] = True

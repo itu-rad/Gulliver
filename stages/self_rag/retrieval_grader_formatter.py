@@ -3,16 +3,34 @@ from utils.chat import apply_chat_template_safe
 from utils.schemas.query import Query
 
 
-class RetrievalGraderFormatter(Stage):
-    def __init__(self, stage_config, pipeline_config):
-        """Initialize the stage by parsing the stage configuration.
+def format_documents(docs) -> str:
+    """Render retrieved documents as numbered paragraphs; shared by every
+    prompt that shows documents."""
+    if isinstance(docs, list):
+        return "\n\n".join(f"Document {i + 1}: {d}" for i, d in enumerate(docs))
+    return str(docs)
 
-        Args:
-            stage_config (dict): Stage configuration, such as batch size and number of workers.
-        """
+
+class RetrievalGraderFormatter(Stage):
+    """Single-pass, per-document relevance grading.
+
+    One LLM call returns a relevance verdict for each retrieved document, so
+    the router can drop irrelevant documents before generation.
+
+    Output contract (parsed by RelevanceFilterRouter): a JSON object mapping
+    document number to "yes"/"no", e.g. {"1": "yes", "2": "no", ...}.
+
+    YAML config example:
+        config:
+          tokenizer_stage_id: 3
+          enable_thinking: true
+    """
+
+    def __init__(self, stage_config, pipeline_config):
         super().__init__(stage_config, pipeline_config)
 
         self._tokenizer_stage_id = self.extra_config["tokenizer_stage_id"]
+        self._enable_thinking = bool(self.extra_config.get("enable_thinking", True))
 
         self._tokenizer = None
 
@@ -23,27 +41,33 @@ class RetrievalGraderFormatter(Stage):
         self._tokenizer = self.dispatch_call(self._tokenizer_stage_id, "get_tokenizer")
 
     def run(self, query: Query) -> dict[int, Query]:
-        """Poll for incoming data in the queues,
-        format the incoming data into a new prompt and pass it onto the output queues.
-        """
-
         retrieved_documents = query.data
+        if not isinstance(retrieved_documents, list):
+            retrieved_documents = [retrieved_documents]
         query.context["retrieved_documents"] = retrieved_documents
         orig_query = query.context["original_query"]
+        n = len(retrieved_documents)
 
+        example = ", ".join(f'"{i + 1}": "yes"' for i in range(min(n, 2)))
         chat = [
             {
                 "role": "system",
-                "content": """
-                You are a grader assessing relevance of a retrieved document to a user question. \n 
-                If the document contains keyword(s) or semantic meaning related to the user question, grade it as relevant. \n
-                It does not need to be a stringent test. The goal is to filter out erroneous retrievals. \n
-                Give a binary score 'yes' or 'no' score to indicate whether the document is relevant to the question. Output nothing but the 'yes' or 'no' score. 
-                """,
+                "content": (
+                    "You are a grader assessing the relevance of retrieved documents "
+                    "to a user question. Grade EACH document separately. A document is "
+                    "relevant if it contains keyword(s) or semantic meaning related to "
+                    "the user question; it does not need to be a stringent test, the "
+                    "goal is to filter out erroneous retrievals. Output ONLY a JSON "
+                    "object mapping each document number to \"yes\" or \"no\", for "
+                    f"all {n} documents, e.g. {{{example}, ...}}. No other text."
+                ),
             },
             {
                 "role": "user",
-                "content": f"Retrieved document: \n\n {retrieved_documents} \n\n User question: {orig_query}",
+                "content": (
+                    f"User question: {orig_query}\n\n"
+                    f"Retrieved documents:\n{format_documents(retrieved_documents)}"
+                ),
             },
         ]
 
@@ -52,9 +76,8 @@ class RetrievalGraderFormatter(Stage):
             chat,
             tokenize=False,
             add_generation_prompt=True,
+            enable_thinking=self._enable_thinking,
         )
-
-        print("Final query", query)
 
         output = {idx: query for idx in self.output_queues}
         return output

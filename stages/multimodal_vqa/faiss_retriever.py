@@ -93,16 +93,14 @@ class FAISSImageRetriever(Stage):
             f"documents via CLIP stage {self._clip_stage_id}"
         )
 
-        # Get text embeddings from the CLIP stage
         text_embeddings = self.dispatch_call(
             self._clip_stage_id, "encode_texts", self._corpus_texts
         )
         text_embeddings = text_embeddings.astype(np.float32)
 
-        # L2-normalise for inner-product search
+        # L2-normalised vectors make inner product equal to cosine similarity.
         faiss.normalize_L2(text_embeddings)
 
-        # Build flat inner-product index
         embed_dim = text_embeddings.shape[1]
         self._index = faiss.IndexFlatIP(embed_dim)
         self._index.add(text_embeddings)

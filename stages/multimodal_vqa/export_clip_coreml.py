@@ -21,8 +21,8 @@ class _CLIPImageFeaturesWrapper(torch.nn.Module):
     512-dim projected embeddings used by encode_texts(), ensuring FAISS
     index dimensions match at query time.
 
-    CoreML cannot convert dict-returning ops, so we strip intermediate
-    outputs to plain tensors before tracing.
+    Core ML cannot convert dict-returning ops, so intermediate outputs are
+    reduced to plain tensors before tracing.
     """
 
     def __init__(self, clip_model):

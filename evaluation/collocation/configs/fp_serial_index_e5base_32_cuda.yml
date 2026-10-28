@@ -1,0 +1,50 @@
+name: serial background alone (fp_serial_index_e5base_32_cuda)
+listeners:
+- dcgmi
+- top
+pipelines:
+- name: BG indexer index_e5base_32
+  inputs:
+  - 0
+  outputs:
+  - 2
+  dataset_stage_id: 0
+  loadgen:
+    component: loadgen.OfflineLoadScheduler
+    queue_depth: 1
+    max_queries: 1000000
+    timeout: 600
+    config:
+      rate: 0
+  stages:
+  - name: Corpus chunk loader
+    id: 0
+    outputs:
+    - 1
+    component: stages.rag_indexing.CorpusChunkLoader
+    config:
+      dataset:
+        name: rag-datasets/rag-mini-wikipedia
+        subset: text-corpus
+        split: passages
+        text_column: passage
+      docs_per_query: 32
+      shard:
+        index: 0
+        count: 1
+  - name: Embed passages (e5base)
+    id: 1
+    outputs:
+    - 2
+    component: stages.rag_indexing.EmbedStage
+    config:
+      model:
+        name: intfloat/e5-base-v2
+      device: cuda
+      max_length: 256
+  - name: Chroma indexer
+    id: 2
+    component: stages.rag_indexing.ChromaIndexer
+    config:
+      collection_name: bg_index_e5base_32_4b_bg_index_mps
+collocation: ''

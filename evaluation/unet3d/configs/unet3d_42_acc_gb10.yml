@@ -1,0 +1,46 @@
+# 3D-UNet on the 42 KiTS19 inference cases: accuracy (Dice) pass.
+name: 3D-UNet KiTS19 42-case online, acc (gb10)
+pipelines:
+- name: 3D-UNet KiTS19
+  inputs:
+  - 0
+  outputs:
+  - 3
+  dataset_stage_id: 0
+  loadgen:
+    component: loadgen.OfflineLoadScheduler
+    queue_depth: 1
+    max_queries: 42
+    timeout: 1800000
+    config:
+      rate: 1
+  stages:
+  - name: KiTS19 case loader
+    id: 0
+    outputs:
+    - 1
+    component: stages.unet3d_kits19.KiTS19CaseLoader
+    config:
+      raw_data_dir: data/kits19/raw
+      cases_json: evaluation/unet3d/inference_cases.json
+  - name: KiTS19 preprocess
+    id: 1
+    outputs:
+    - 2
+    component: stages.unet3d_kits19.KiTS19Preprocess
+    config:
+      keep_label: true
+  - name: 3D-UNet sliding-window inference
+    id: 2
+    outputs:
+    - 3
+    component: stages.unet3d_kits19.UNet3DInference
+    config:
+      model_path: models/3dunet_kits19/3dunet_kits19_pytorch.ptc
+      device: cuda
+  - name: DICE scorer
+    id: 3
+    component: stages.unet3d_kits19.KiTS19DiceScore
+    config: {}
+  serialize_queries: true
+listeners: []

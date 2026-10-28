@@ -1,3 +1,4 @@
+# MLPerf-style GPT-J inference.
 name: Gpt-J 6B implementation of MLPerf Inference v5.0
 pipelines:
   - name: Gpt-J 6B implementation of MLPerf Inference v5.0

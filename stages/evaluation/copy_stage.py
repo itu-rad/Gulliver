@@ -12,7 +12,6 @@ class CopyStage(Stage):
 
     def run(self, query: Query) -> dict[int, Query]:
         if query.data is not None:
-            # Force a deep copy of the data payload
             query.data = copy.deepcopy(query.data)
         
         return {idx: query for idx in self.output_queues}

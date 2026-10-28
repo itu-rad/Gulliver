@@ -9,9 +9,9 @@ from utils.schemas import StageModel, PipelineModel, Query
 
 
 class CLIPVisionEncoderCoreML(Stage):
-    """Encodes images using a pre-exported CoreML CLIP vision encoder.
+    """Encodes images using a pre-exported Core ML CLIP vision encoder.
 
-    Runs on ANE automatically via CoreML dispatch.
+    Core ML decides the compute unit (CPU, GPU or Neural Engine).
 
     YAML config example:
         config:
@@ -110,12 +110,12 @@ class CLIPVisionEncoderCoreML(Stage):
         """
         pil_image, question = query.data
 
-        # Preprocess image using HF processor, then extract pixel
-        # values as numpy for CoreML.
+        # Fast image processors only emit torch tensors (return_tensors="np"
+        # raises), so request "pt" and convert to numpy for Core ML.
         inputs = self._processor(
-            images=pil_image, return_tensors="np"
+            images=pil_image, return_tensors="pt"
         )
-        pixel_values = inputs["pixel_values"].astype(np.float32)
+        pixel_values = inputs["pixel_values"].numpy().astype(np.float32)
 
         prediction = self._coreml_model.predict(
             {"pixel_values": pixel_values}

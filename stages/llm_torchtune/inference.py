@@ -64,11 +64,9 @@ class Inference(Stage):
         return checkpoint_dict
 
     def _setup_model(self):
-        # Configure device and precision
         with set_default_dtype(self._dtype), self._device:
             self._model = get_component(self.extra_config["model"]["component"])()
 
-        # Load the base model checkpoint
         base_model_state_dict = self._checkpoint_dict[MODEL_KEY]
         self._model.load_state_dict(base_model_state_dict, strict=False)
 

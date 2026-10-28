@@ -1,11 +1,13 @@
 import threading
 import uuid
-from random import expovariate
+from random import Random
 from time import sleep, time
 
 import mlflow
+from utils.trace_span import trace_span
 
 from utils.schemas import Query
+from .arrival_log import ArrivalLog
 from .scheduler import LoadScheduler
 
 
@@ -27,6 +29,9 @@ class PoissonLoadScheduler(LoadScheduler):
         super().__init__(max_queries, timeout, load_scheduler_config, dataset_splits)
 
         self.rate = self.extra_config.get("rate", 3)
+        # Seeded so that runs being compared see the same arrival sequence.
+        self.seed = self.extra_config.get("seed", 0)
+        self._rng = Random(self.seed)
         self.offsets = []
 
     def prepare(self) -> None:
@@ -43,7 +48,7 @@ class PoissonLoadScheduler(LoadScheduler):
         """
         self.offsets = [0]
         for _ in range(self.max_queries - 1):
-            self.offsets.append(expovariate(self.rate))
+            self.offsets.append(self._rng.expovariate(self.rate))
 
     def generate(self, queue, event):
         """
@@ -56,26 +61,34 @@ class PoissonLoadScheduler(LoadScheduler):
         The method also handles timeout and stop signals to ensure proper termination of the query generation process.
         """
 
-        # start the timeout timer
         self.timer.start()
-        # release the lock, so the pipeline thread can execute
         event.set()
 
         counter = 0
+
+        # Coordinated-omission check: a put() slower than this threshold means
+        # the entry queue was full and arrivals were throttled.
+        _block_threshold_s = 0.005
+        _blocked_puts = 0
+        _total_block_s = 0.0
+        _max_block_s = 0.0
+
+        # Intended arrival of query i is t0 + sum(offsets[:i+1]).
+        _arrivals = ArrivalLog()
+        _t0 = None
+        _intended = 0.0
 
         try:
             while counter < self.max_queries:
                 for split_name, split_batches in self.dataset_splits.items():
                     for batch_idx in range(split_batches):
-                        # look for a timeout
                         if self.stop:
                             break
 
-                        # sleep until it's time to generate next query
                         sleep(self.offsets[counter])
 
                         flow_id = uuid.uuid4()
-                        with mlflow.start_span(
+                        with trace_span(
                             name="generate query",
                             attributes={
                                 "out_flow_id": str(flow_id),
@@ -85,32 +98,48 @@ class PoissonLoadScheduler(LoadScheduler):
                                 "split": split_name,
                             },
                         ):
-                            # push the query onto queue (BLOCKING — if entry
-                            # queue is full because pipeline is in serialize
-                            # mode or just slow, wait for the consumer instead
-                            # of crashing with queue.Full).
+                            # Blocking put: back-pressure instead of queue.Full.
+                            _t_put = time()
+                            _submitted = time()
                             queue.put(
                                 Query(
                                     split=split_name,
                                     batch=batch_idx,
-                                    query_submitted_timestamp=time(),
+                                    query_submitted_timestamp=_submitted,
                                     out_flow_id=flow_id,
                                 )
                             )
+                            _put_s = time() - _t_put
 
-                        # increament the counter and check that it does not exceed max_queries
+                        if _put_s > _block_threshold_s:
+                            _blocked_puts += 1
+                            _total_block_s += _put_s
+                            _max_block_s = max(_max_block_s, _put_s)
+
+                        if _t0 is None:
+                            _t0 = _submitted
+                        _intended += self.offsets[counter]
+                        _arrivals.record(counter, _t0 + _intended, _submitted, _put_s)
+
                         counter += 1
                         if counter >= self.max_queries:
                             self.stop = True
                             break
-                    # propagate the stop signal
                     if self.stop:
                         break
-                # propagate the stop signal
                 if self.stop:
                     break
         finally:
-            # Always send terminator and cancel the timer, even on exception,
-            # so downstream stages don't hang and we don't leak a Timer thread.
+            # Always send the terminator and cancel the timer, even on exception.
             queue.put(None)
             self.timer.cancel()
+            _arrivals.write()
+            if _blocked_puts:
+                print(
+                    f"[loadgen] WARNING coordinated omission: {_blocked_puts}/{counter} "
+                    f"submits blocked on a full entry queue "
+                    f"(total {_total_block_s:.3f}s, max {_max_block_s * 1000:.1f}ms). "
+                    f"The realized arrival process was throttled below the intended "
+                    f"Poisson rate={self.rate}; raise queue_depth or lower the rate for a "
+                    f"valid open-loop latency measurement."
+                )

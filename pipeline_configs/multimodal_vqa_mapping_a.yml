@@ -1,3 +1,4 @@
+# Multimodal VQA: CLIP image encoding on the GPU, FAISS retrieval, LLM answer.
 name: "Multimodal VQA - Mapping A (Naive MPS Monolith)"
 pipelines:
   - name: VQA MPS Monolith
@@ -10,15 +11,9 @@ pipelines:
       max_queries: 30
       timeout: 600000
       config:
-        # Arrival rate faster than LLM service time (~3 s/query) so the
-        # entry queue backs up — required to actually exercise stage
-        # pipelining and surface MPS/ANE/CPU contention.
         rate: 2.0
-    # Toggle via `python main.py --serialize true` to force one query at
-    # a time end-to-end (no pipelining). Default false = pipelined.
     serialize_queries: false
     stages:
-      # --- Stage 0: VQA DataLoader ---
       - name: VQA dataloader
         id: 0
         outputs: [1]
@@ -33,7 +28,6 @@ pipelines:
             max_samples: 100
           batch_size: 1
 
-      # --- Stage 1: CLIP Vision Encoder (MPS) ---
       - name: CLIP vision encoder
         id: 1
         outputs: [2]
@@ -43,7 +37,6 @@ pipelines:
             name: openai/clip-vit-large-patch14
           device: mps
 
-      # --- Stage 2: FAISS Image Retriever (CPU) ---
       - name: FAISS retriever
         id: 2
         outputs: [3]
@@ -57,7 +50,6 @@ pipelines:
             max_docs: 10000
           top_k: 3
 
-      # --- Stage 3: VQA Prompt Formatter ---
       - name: VQA formatter
         id: 3
         outputs: [4]
@@ -66,7 +58,6 @@ pipelines:
           tokenizer_stage_id: 4
           system_prompt: "You are a helpful assistant. Use the provided context to answer the question concisely."
 
-      # --- Stage 4: LLM Generator (MLX/MPS) ---
       - name: LLM generator
         id: 4
         outputs: [5]
@@ -77,7 +68,6 @@ pipelines:
             gen_kwargs:
               max_tokens: 128
 
-      # --- Stage 5: Terminal capture ---
       - name: End stage
         id: 5
         component: stages.TerminalCapture

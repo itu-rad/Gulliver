@@ -9,17 +9,12 @@ from . import kits19_lib as kl
 
 class UNet3DInference(Stage):
     """Gaussian-weighted sliding-window inference for the MLPerf 3D-UNet
-    (nnU-Net) KiTS19 model — the ONLY part MLPerf times.
+    (nnU-Net) KiTS19 model.
 
-    Ports base_SUT.infer_single_query: tile the preprocessed volume into 128³
-    ROIs at 50% overlap, run the TorchScript model on each, accumulate the
-    logits weighted by a cube-root Gaussian patch, divide by the coverage map,
-    argmax → uint8 segmentation. 8–144 forward passes per case (volume-dependent),
-    so each query is seconds-scale — a genuinely heavier accelerator workload
-    than the per-image ResNet it replaces in the overhead study.
-
-    The model is a TorchScript checkpoint (``model_path``); ``device`` is cuda
-    (GB10) or mps (M2 Pro) — same torch backend both places, no separate engine.
+    Port of MLPerf's base_SUT.infer_single_query: tile the volume into ROIs
+    with overlap, accumulate Gaussian-weighted logits, normalise by the
+    coverage map and take the argmax. Config: ``model_path`` (TorchScript)
+    and optional ``device`` (cuda, mps or cpu; auto-detected if unset).
 
     Input : query.data = {case, image, label, aux, n_subvolumes}
     Output: query.data = {case, segmentation[1,1,D,H,W] uint8, label, aux}

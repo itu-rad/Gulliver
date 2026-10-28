@@ -1,71 +1,42 @@
-# Versions pinned to match the verified-working nvidia env (see nvidia.yaml and
-# REPLICATION_NOTES.md). The original macos.yaml left torch/torchaudio/
-# transformers/datasets/etc. un-pinned; on a fresh install pip resolved them to
-# newer, mutually-incompatible versions that broke model loading. These are the
-# same pins that fixed the nvidia env, minus the CUDA-only bits (the plain
-# `torch` wheel already targets Apple Silicon Metal/MPS). mlx / mlx-lm are left
-# un-pinned on purpose: the case-study models (Qwen3.5 "OptiQ" quants) use a new
-# architecture that only the latest mlx-lm understands.
-name: benchmark_macos
+# Apple silicon (MLX, PyTorch MPS). radT is installed separately, see README.md.
+name: gulliver_macos
 dependencies:
-  - python=3.10
+  - python=3.10.20
   - pip
   - pip:
-    # RadT dependencies
+    # radT dependencies
     - tensorflow==2.20.0
     - tensorboardX==2.6.4
-    - mlflow==3.10.0
+    - mlflow==3.15.1
     - boto3==1.42.57
     - psutil==7.2.2
-    # radt async_tracing branch (non-blocking MLflow span export -> realistic tracing
-    # overhead). Pinned to commit 9dda7b8 (branch head incl. bounded async export queue) of feat/Sipondo/async_tracing; package in radt/ subdir.
-    - git+https://github.com/itu-rad/radt.git@9dda7b82d87daad792074ee21463669e503515a0#subdirectory=radt
-    # NOTE: production install additionally applies evaluation/radt-patches/
-    # 0001-amc-bandwidth-listener.patch (AMCBandwidth listener, local commit
-    # f9a61e8 — unpushed by design): clone @9dda7b8, git am the patch, pip
-    # install ./radt. The listener no-ops on non-Apple hosts.
 
-    # Tracing + Perfetto export
+    # Tracing and Perfetto export
     - sqlalchemy==2.0.47
     - pandas==2.3.3
     - psycopg2-binary==2.9.12
     - perfetto==0.56.0
 
-    # benchmark dependencies
-    ## general
+    # Framework and stages
     - torch==2.10.0
     - torchvision==0.25.0
-    - torchaudio==2.10.0        # MUST match torch 2.10; un-pinned drifts and breaks transformers
+    - torchaudio==2.10.0
     - torchtune==0.6.1
+    - torchao==0.11.0
     - transformers==5.2.0
+    - accelerate==1.14.0
     - datasets==4.6.0
     - peft==0.18.1
     - pydantic_yaml==1.6.0
     - outlines==1.2.11
-    - tf-keras==2.20.1          # compatibility between transformers and tensorflow
-
-    ## multimodal VQA case study
-    - faiss-cpu
-    - coremltools
-    - Pillow
-
-    ## Self-RAG case study
+    - tf-keras==2.20.1
     - chromadb==1.5.9
-
-    ## 3D-UNet / KiTS19 preprocessing (evaluation/unet3d, Finding A)
-    # nibabel loads the NIfTI volumes; scipy does the resample/normalize/pad. Left
-    # unpinned — leaf deps pip resolves against the numpy the pinned stack already
-    # fixes. scipy was previously only transitive (via tensorflow/mlflow); declared
-    # explicitly here so a clean env has it.
-    - nibabel
-    - scipy
-
-    ## local inference engines (stages.llm_server)
-    # litellm talks to a local Ollama server over its HTTP API. vLLM is
-    # NVIDIA-only, so only the Ollama engine is usable on macOS.
-    - litellm
-
-    ## macos specific
-    - mlx
-    - mlx-lm
-    # ANEMLL will be installed from source
+    - sentence-transformers==5.6.0
+    - litellm==1.92.0
+    - nibabel==5.4.2
+    - scipy==1.15.3
+    - Pillow==12.3.0
+    - faiss-cpu==1.14.3
+    - coremltools==9.0
+    - mlx==0.32.0
+    - mlx-lm==0.31.3

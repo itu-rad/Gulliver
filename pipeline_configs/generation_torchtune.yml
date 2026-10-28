@@ -1,3 +1,4 @@
+# LLM generation with torchtune (weights expected in tmp/Qwen2.5-0.5B-Instruct).
 name: "PHI3 Mini Alpaca generation pipeline"
 listeners:
   - smi

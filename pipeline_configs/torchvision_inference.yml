@@ -1,3 +1,4 @@
+# Image classification inference with TorchVision.
 name: "EfficientNetv2 S Imagenette single inference pipeline benchmark"
 listeners:
   - smi
@@ -11,11 +12,11 @@ pipelines:
     dataset_stage_id: 0
     loadgen:
       component: loadgen.PoissonLoadScheduler
-      max_queries: 200
-      timeout: 30
-      queue_depth: 10
+      queue_depth: 100
+      max_queries: 100
+      timeout: 915
       config:
-        rate: 10 # average #requests/sec
+        rate: 0.5534
     stages:
       - name: Load Imagenette samples from TorchVision Dataset
         id: 0
@@ -48,7 +49,6 @@ pipelines:
         config:
           model: 
             component: torchvision.models.efficientnet_v2_s
-            # model_checkpoint_path: "tmp/efficientnet_v2_imagenette.pth"
             replace_classifier: True
             num_classes: 10
           optimizer:

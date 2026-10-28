@@ -95,7 +95,6 @@ class Finetune(Stage):
         4. Enables activation checkpointing for memory efficiency.
         5. Loads the base model checkpoint into the model.
         """
-        # Configure device and precision
         with set_default_dtype(self._dtype), self._device:
             model_cls = get_component(self.extra_config["model"]["component"])
             self._model = model_cls(
@@ -106,16 +105,13 @@ class Finetune(Stage):
                 lora_alpha=self.extra_config["model"]["lora_alpha"],
             )
 
-        # Set adapter parameters as trainable
         adapter_params = get_adapter_params(self._model)
         set_trainable_params(self._model, adapter_params)
 
-        # Activation checkpointing
         set_activation_checkpointing(
             self._model, auto_wrap_policy={TransformerSelfAttentionLayer}
         )
 
-        # Load the base model checkpoint
         base_model_state_dict = self._checkpoint_dict[MODEL_KEY]
         self._model.load_state_dict(base_model_state_dict, strict=False)
 
@@ -160,7 +156,6 @@ class Finetune(Stage):
         logits = logits[..., :-1, :].contiguous()
         labels = labels[..., 1:].contiguous()
         logits = logits.transpose(1, 2)
-        # Compute loss
         loss = self._loss_fn(logits, labels)
         loss = loss / self._gradient_accumulation_steps
         self._running_loss += loss

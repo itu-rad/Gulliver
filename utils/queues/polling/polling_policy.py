@@ -16,10 +16,8 @@ class PollingPolicy(ABC):
         notify_condition: threading.Condition | None = None,
     ):
         self.input_queues = input_queues
-        # Fan-in policies wait on this condition (signalled by PeekableQueue.put)
-        # instead of busy-waiting. If none is supplied we fall back to a private
-        # condition so ``wait(timeout=...)`` degrades to slow polling rather than
-        # crashing; single-queue consumers ignore it entirely.
+        # Signalled by PeekableQueue.put. Without one, a private condition makes
+        # ``wait(timeout=...)`` degrade to slow polling.
         self._cond = notify_condition if notify_condition is not None else threading.Condition()
 
     @abstractmethod

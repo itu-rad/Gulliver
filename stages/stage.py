@@ -4,11 +4,11 @@ from threading import Thread
 from functools import wraps
 import logging
 import threading
-import uuid
 from typing import Any
 import json
 
 import mlflow
+from utils.trace_span import trace_span, SPANS_ENABLED, new_flow_id
 
 from utils.queues.polling.polling_policy import PollingPolicy
 from utils.queues.peekable_queue import PeekableQueue
@@ -65,40 +65,96 @@ def log_phase_single(parent_name, name, phase, start):
     )
 
 
-def log_first_token(stage: "Stage", event: str) -> None:
-    """Log one edge of a generator stage's "first_token" sub-phase.
+def marker_span(stage: "Stage", name: str, attributes: dict | None = None) -> None:
+    """Emit a zero-duration span marking an instant in `stage`'s current query.
 
-    Goes through the exact same benchmark-logger path as log_phase_single, so
-    (with utils/logger.py PERF_FORMAT) the trace CSV row is
+    Not gated by `disable_logs`, so the timing is available from spans alone.
+    Names must be unique per query.
+    """
+    if not SPANS_ENABLED:
+        return
+    attrs = {"stage": stage.name,
+             "query_id": getattr(stage, "current_query_id", None)}
+    if attributes:
+        attrs.update(attributes)
+    with trace_span(name=f"{stage.name}.{name}", attributes=attrs):
+        pass
+
+
+def log_first_token(stage: "Stage", event: str) -> None:
+    """Log one edge of a generator stage's "first_token" sub-phase:
 
         wall, <pipeline>, <stage>, first_token, {start|end}, perf
 
-    which evaluation/contention/staged_lib.py keys as the
-    "<stage>::first_token" sub-phase and pairs start/end; the Step D analyzer
-    then derives ttft = pair_end_perf - stage_run_start_perf. Emit "start"
-    immediately before the generate call and "end" at the first produced
-    token, exactly once per run() invocation, so sub-phase pairs stay 1:1
-    with the stage's run start/end pairs (staged_lib aligns them by index).
-    Gated by disable_logs identically to the per-query run rows.
+    Emit "start" right before generation and "end" at the first produced token,
+    once per run() call.
     """
+    marker_span(stage, f"first_token_{event}")
     if not stage.disable_logs:
         log_phase_single(stage.parent_name, stage.name, "first_token", event)
 
 
 def log_generated_tokens(stage: "Stage", n_tokens: int) -> None:
-    """Log the real per-query generated-token count as a companion trace row:
+    """Log the per-query generated-token count:
 
         wall, <pipeline>, <stage>, n_generated_tokens, <int>, perf
-
-    Field 5 is the count, not start/end, so existing parsers
-    (staged_lib.parse_trace_files filters on start|end) skip the row —
-    backward compatible. Analyzers should prefer this over the config's
-    gen_kwargs.max_tokens when present (early EOS makes max_tokens an
-    overestimate). Gated by disable_logs like all per-query stage rows.
     """
+    marker_span(stage, "generated_tokens", {"n_generated_tokens": n_tokens})
     if not stage.disable_logs:
         logging.getLogger("benchmark").info(
             "%s, %s, n_generated_tokens, %d", stage.parent_name, stage.name,
+            n_tokens,
+        )
+
+
+def log_reasoning_tokens(stage: "Stage", n_reasoning: int, n_answer: int,
+                         closed: bool, forced: bool) -> None:
+    """Log the split of a generation into reasoning and answer tokens:
+
+        wall, <pipeline>, <stage>, n_reasoning_tokens, <int>, perf
+        wall, <pipeline>, <stage>, n_answer_tokens, <int>, perf
+        wall, <pipeline>, <stage>, thinking_closed, {0|1|2}, perf
+
+    thinking_closed: 1 = the model closed its reasoning block, 2 = the budget
+    ran out and the block was forced closed, 0 = no answer was produced.
+    """
+    marker_span(stage, "reasoning_tokens",
+                {"n_reasoning_tokens": n_reasoning, "n_answer_tokens": n_answer,
+                 "thinking_closed": bool(closed), "thinking_forced": bool(forced)})
+    if not stage.disable_logs:
+        lg = logging.getLogger("benchmark")
+        lg.info("%s, %s, n_reasoning_tokens, %d", stage.parent_name, stage.name,
+                n_reasoning)
+        lg.info("%s, %s, n_answer_tokens, %d", stage.parent_name, stage.name,
+                n_answer)
+        lg.info("%s, %s, thinking_closed, %d", stage.parent_name, stage.name,
+                2 if forced else (1 if closed else 0))
+
+
+def log_peak_memory(stage: "Stage", peak_bytes: int, source: str) -> None:
+    """Log the process-level peak accelerator memory, as reported by the
+    backend's allocator, at stage teardown:
+
+        wall, <pipeline>, <stage>, peak_memory_bytes, <int>, perf
+    """
+    marker_span(stage, "peak_memory", {"peak_memory_bytes": int(peak_bytes),
+                                       "source": source})
+    if not stage.disable_logs:
+        logging.getLogger("benchmark").info(
+            "%s, %s, peak_memory_bytes, %d", stage.parent_name, stage.name,
+            int(peak_bytes),
+        )
+
+
+def log_prompt_tokens(stage: "Stage", n_tokens: int) -> None:
+    """Log the per-query prompt (prefill) token count:
+
+        wall, <pipeline>, <stage>, n_prompt_tokens, <int>, perf
+    """
+    marker_span(stage, "prompt_tokens", {"n_prompt_tokens": n_tokens})
+    if not stage.disable_logs:
+        logging.getLogger("benchmark").info(
+            "%s, %s, n_prompt_tokens, %d", stage.parent_name, stage.name,
             n_tokens,
         )
 
@@ -120,12 +176,20 @@ class Stage:
         self.extra_config = stage_config.config
         self._stage_dict: dict[int, Stage] = {}
         self._input_queues: dict[int, PeekableQueue] = {}
-        # One condition per consuming stage, shared by all of its input queues
-        # (which notify it on put) and its polling policy (which waits on it),
-        # so fan-in polling blocks instead of busy-waiting.
+        # Shared by the input queues and the polling policy, so fan-in blocks
+        # instead of busy-waiting.
         self._input_cond = threading.Condition()
+        self._keep_payload_at_exit = getattr(
+            self._stage_config, "keep_payload_at_exit", False)
         self.output_queues: dict[int, Queue] = {}
         self._logger = logging.getLogger("benchmark")
+        # Per thread, because some stages process queries on several workers.
+        self._current = threading.local()
+
+    @property
+    def current_query_id(self):
+        """Query id this thread is processing, or None outside a query."""
+        return getattr(self._current, "query_id", None)
 
     def __str__(self) -> str:
         """
@@ -227,9 +291,13 @@ class Stage:
         """
         if (
             len(self._input_queues) > 1
-            and self._polling_policy == "stages.queues.polling.SingleQueuePolicy"
+            and self._polling_policy.rsplit(".", 1)[-1] == "SingleQueuePolicy"
         ):
-            raise ValueError("SingleQueuePolicy only works with one input queue")
+            raise ValueError(
+                f"SingleQueuePolicy only works with one input queue "
+                f"(stage {self.name!r} has {len(self._input_queues)}); "
+                f"use a multi-queue polling policy"
+            )
         self._polling_policy_obj: PollingPolicy = get_component(self._polling_policy)(
             self._input_queues, self._input_cond
         )
@@ -260,9 +328,20 @@ class Stage:
             outputs (dict[int, any]): dictionary of outputs, where keys are the stage IDs
                 and values are the outputs to be pushed to the corresponding output queue.
         """
-        with mlflow.start_span(
+        qid = next((getattr(o, "query_id", None) for o in outputs.values()
+                    if o is not None), None)
+        # The payload of a query leaving the pipeline is not read again; release
+        # it on this stage's thread rather than on the result collector's.
+        if -1 in self.output_queues and not self._keep_payload_at_exit:
+            for output in outputs.values():
+                if output is not None:
+                    output.data = None
+
+        with trace_span(
             name=f"{self.name}.push_to_outputs",
-            attributes={"thread_id": threading.get_ident()},
+            attributes=({"thread_id": threading.get_ident(),
+                         "stage": self.name, "query_id": qid}
+                        if SPANS_ENABLED else None),
         ):
             for idx, output in outputs.items():
                 self.output_queues[idx].put(output)
@@ -299,34 +378,34 @@ class Stage:
 
     def _process_query(self, query: Query) -> None:
         """Run a single query through self.run, wrapped in its tracing span,
-        and push the results to the output queues.
-
-        Factored out of run_wrapper so stages that dispatch queries
-        concurrently (e.g. stages.llm_server.Inference) can reuse the exact
-        same span/flow/logging contract from a worker thread.
+        and push the results to the output queues. Also used by stages that
+        process queries on their own worker threads.
         """
         if not self.disable_logs:
             log_phase_single(self.parent_name, self.name, "run", "start")
 
-        in_flow_id = str(query.out_flow_id) if query.out_flow_id else None
-        out_flow_id = uuid.uuid4()
-        with mlflow.start_span(
-            name=f"{self.name}.run",
-            attributes={
-                "in_flow_id": in_flow_id,
-                "out_flow_id": str(out_flow_id),
+        self._current.query_id = query.query_id
+        # Kept minimal: this sits on the hand-off path between stages.
+        if SPANS_ENABLED:
+            out_flow_id = new_flow_id()
+            attributes = {
+                "in_flow_id": query.out_flow_id,
+                "out_flow_id": out_flow_id,
                 "thread_id": threading.get_ident(),
                 "stage": self.name,
                 "epoch": query.epoch,
                 "split": query.split,
                 "batch": query.batch,
                 "query_id": query.query_id,
-            },
-        ):
+            }
+        else:
+            out_flow_id, attributes = None, None
+        with trace_span(name=f"{self.name}.run", attributes=attributes):
             query.out_flow_id = out_flow_id
             outputs = self.run(query)
 
         self._push_to_outputs(outputs)
+        self._current.query_id = None
         if not self.disable_logs:
             log_phase_single(self.parent_name, self.name, "run", "end")
 
@@ -335,11 +414,8 @@ class Stage:
         perform actions on them and push the results onto the output queues."""
         self.pre_run()
         while True:
-            with mlflow.start_span(
-                name=f"{self.name}.get_input",
-                attributes={"thread_id": threading.get_ident()},
-            ):
-                query = self._get_input_from_queues()
+            # The wait is not spanned: it cannot be attributed to a query.
+            query = self._get_input_from_queues()
             if not query:
                 # received terminating element (None)
                 self._push_to_all_outputs(None)
@@ -348,10 +424,8 @@ class Stage:
             try:
                 self._process_query(query)
             except Exception:
-                # A dead stage thread must not silently hang the pipeline until
-                # the run timeout (it burned a 1h pilot slot on 2026-07-14):
-                # log loudly, propagate the terminator so downstream drains and
-                # the run FAILS FAST, then re-raise for the traceback.
+                # Propagate the terminator so the pipeline fails fast instead of
+                # hanging until the run timeout.
                 import traceback
                 print(f"[stage FATAL] {self.name}: exception in run(); "
                       f"terminating pipeline", flush=True)

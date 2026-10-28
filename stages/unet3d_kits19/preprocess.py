@@ -1,16 +1,12 @@
-from stages.stage import Stage, log_phase
+from stages.stage import Stage, log_phase, marker_span
 from utils.schemas import Query
 
 from . import kits19_lib as kl
 
 
 class KiTS19Preprocess(Stage):
-    """The resample → clip/normalize → pad chain MLPerf runs offline and excludes
-    from its timed section. In Choreo it is a first-class timed stage, which is
-    the point of the workload: for KiTS19 this preprocessing is heavy (trilinear
-    resample of a multi-hundred-slice CT volume) and dominates end-to-end latency
-    on many cases, so a benchmark that hides it (MLPerf) misreports the real cost
-    of serving the model.
+    """Resample, clip/normalize and pad a KiTS19 case. MLPerf runs this offline;
+    here it is a timed stage.
 
     Input  : query.data = {case, image_path, label_path} (from KiTS19CaseLoader)
     Output : query.data = {case, image[1,D,H,W] float32, label|None, aux,
@@ -31,12 +27,20 @@ class KiTS19Preprocess(Stage):
         image, label, aux = kl.preprocess_volume(
             payload["image_path"], label_path)
 
+        n_sub = kl.count_subvolumes(image[None, ...] if image.ndim == 4 else image)
         query.data = {
             "case": payload["case"],
             "image": image,
             "label": label,
             "aux": aux,
-            "n_subvolumes": kl.count_subvolumes(image[None, ...]
-                                                if image.ndim == 4 else image),
+            "n_subvolumes": n_sub,
         }
+        # Record the case size on this query's trace. marker_span ignores
+        # `disable_logs`, so the size is kept even with CSV logging off.
+        marker_span(self, "case_size", {
+            "case": payload["case"],
+            "n_subvolumes": n_sub,
+            # Post-resample shape, i.e. what inference tiles over.
+            "image_shape": "x".join(str(d) for d in image.shape[-3:]),
+        })
         return {idx: query for idx in self.output_queues}

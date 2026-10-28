@@ -3,8 +3,6 @@ from typing import Any
 from abc import ABC, abstractmethod
 import json
 
-# other scheduler options include: gamma distribution, paretto distribution, weibull distribution
-
 
 class LoadScheduler(ABC):
     """Base load scheduler class, responsible for generating load for a single pipeline."""

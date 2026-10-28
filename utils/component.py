@@ -20,7 +20,6 @@ class InstantiationError(Exception):
         self.errors = errors
 
     def __str__(self):
-        # error_messages = [f"{type(e).__name__}: {str(e)}" for e in self.errors]
         return (
             "Unable to instantiate component, found the following errors: \n"
             + self.errors
@@ -93,13 +92,13 @@ def get_component(path):
             + f"\nAre you sure that module '{part0}' is installed?"
         ) from exc_import
     # Subsequent components can be checked via getattr() on first module
-    # It can either be an attribute that we can return or a submodule that we
-    # can import and continue searching
+    # It can either be an attribute to return or a submodule to import and
+    # continue searching
     for m in range(1, len(parts)):
         part = parts[m]
         try:
             obj = getattr(obj, part)
-        # If getattr fails, check to see if it's a module we can import and
+        # If getattr fails, check whether it is an importable module and
         # continue down the path
         except AttributeError as exc_attr:
             parent_dotpath = ".".join(parts[:m])

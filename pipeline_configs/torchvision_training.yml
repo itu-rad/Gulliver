@@ -1,3 +1,4 @@
+# Image classification fine-tuning with TorchVision.
 name: "EfficientNetv2 S Imagenette single training pipeline benchmark"
 listeners:
   - smi
@@ -31,14 +32,6 @@ pipelines:
             component: torchvision.datasets.Imagenette
             split: [train, val]
             weights: EfficientNet_V2_S_Weights.IMAGENET1K_V1
-      # - name: Preprocess Imagenette data coming from DataLoader
-      #   id: 1
-      #   outputs: [2]
-      #   component: stages.torchvision_classification.TorchVisionPreprocessFromWeights
-      #   polling_policy: utils.queues.polling.SingleQueuePolicy
-      #   disable_logs: false
-      #   config:
-      #     weights: EfficientNet_V2_S_Weights.IMAGENET1K_V1
       - name: EfficientNet training
         id: 1
         outputs: []
@@ -48,7 +41,6 @@ pipelines:
         config:
           model: 
             component: torchvision.models.efficientnet_v2_s
-            # model_checkpoint_path: "tmp/efficientnet_v2_imagenette.pth"
             replace_classifier: True
             num_classes: 10
           optimizer:

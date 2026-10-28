@@ -1,0 +1,12 @@
+
+cells:
+  - {tag: effv2s, model: efficientnet_v2_s, weights: EfficientNet_V2_S_Weights.IMAGENET1K_V1, batch: 1,  max_batches: 300}
+  - {tag: effv2s, model: efficientnet_v2_s, weights: EfficientNet_V2_S_Weights.IMAGENET1K_V1, batch: 2,  max_batches: 300}
+  - {tag: effv2s, model: efficientnet_v2_s, weights: EfficientNet_V2_S_Weights.IMAGENET1K_V1, batch: 4,  max_batches: 300}
+  - {tag: effv2s, model: efficientnet_v2_s, weights: EfficientNet_V2_S_Weights.IMAGENET1K_V1, batch: 8,  max_batches: 300}
+  - {tag: effv2s, model: efficientnet_v2_s, weights: EfficientNet_V2_S_Weights.IMAGENET1K_V1, batch: 16, max_batches: 300}
+  - {tag: effv2s, model: efficientnet_v2_s, weights: EfficientNet_V2_S_Weights.IMAGENET1K_V1, batch: 32, max_batches: 300}
+  - {tag: effv2s, model: efficientnet_v2_s, weights: EfficientNet_V2_S_Weights.IMAGENET1K_V1, batch: 64, max_batches: 300}
+
+  - {tag: effv2m,    model: efficientnet_v2_m, weights: EfficientNet_V2_M_Weights.IMAGENET1K_V1, batch: 8, max_batches: 300}
+  - {tag: effv2l,    model: efficientnet_v2_l, weights: EfficientNet_V2_L_Weights.IMAGENET1K_V1, batch: 8, max_batches: 300}

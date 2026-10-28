@@ -1,3 +1,4 @@
+# MLPerf-style RetinaNet inference on OpenImages.
 name: "RetinaNet implementation of MLPerf Inference v5.0"
 pipelines:
   - name: RetinaNet inference
@@ -26,8 +27,8 @@ pipelines:
           dataset:
             component: torchvision.datasets.CocoDetection
             split: [val]
-            root: /home/roba/collocation-benchmark/tmp/torchvision_dataset/openimages/validation/data
-            annFile: /home/roba/collocation-benchmark/tmp/torchvision_dataset/openimages/annotations/openimages-mlperf.json
+            root: tmp/torchvision_dataset/openimages/validation/data
+            annFile: tmp/torchvision_dataset/openimages/annotations/openimages-mlperf.json
             transform: stages.torchvision_classification.transform_openimages
       - name: RetinaNet inference
         id: 1
@@ -39,7 +40,6 @@ pipelines:
           model: 
             component: torchvision.models.detection.retinanet_resnet50_fpn
             weights: RetinaNet_ResNet50_FPN_Weights.DEFAULT
-            # num_classes: 264
             weights_backbone: ResNet50_Weights.IMAGENET1K_V1
           device: cuda
       - name: Detection postporcess

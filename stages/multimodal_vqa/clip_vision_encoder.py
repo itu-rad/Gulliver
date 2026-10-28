@@ -39,7 +39,7 @@ def _get_clip_image_features(model, inputs):
 
 
 class CLIPVisionEncoder(Stage):
-    """Encodes images into CLIP embeddings using transformers on MPS.
+    """Encodes images into CLIP embeddings using transformers.
 
     YAML config example:
         config:
@@ -100,8 +100,8 @@ class CLIPVisionEncoder(Stage):
             with torch.no_grad():
                 text_features = _get_clip_text_features(self._model, inputs)
             all_embeddings.append(text_features.cpu().numpy())
-            # Prevent MPS allocator from accumulating intermediates across
-            # the large indexing loop (100k+ texts otherwise OOM on M*).
+            # Periodically release cached MPS memory; a long indexing loop
+            # otherwise accumulates intermediates until it runs out of memory.
             if self._device == "mps" and (i // batch_size) % 16 == 15:
                 torch.mps.empty_cache()
         return np.concatenate(all_embeddings, axis=0)
@@ -120,17 +120,21 @@ class CLIPVisionEncoder(Stage):
         """Encode a PIL image into a CLIP embedding.
 
         Args:
-            query: Query with data=(PIL_image, question_str).
+            query: Query with data=(PIL_image or pixel_values tensor, question_str).
 
         Returns:
             dict[int, Query]: Query with data=image_embedding (numpy).
         """
-        pil_image, question = query.data
+        image, question = query.data
 
-        inputs = self._processor(
-            images=pil_image, return_tensors="pt"
-        )
-        inputs = {k: v.to(self._device) for k, v in inputs.items()}
+        if isinstance(image, torch.Tensor):
+            # already preprocessed by CLIPImagePreprocess (pixel_values on the CPU)
+            inputs = {"pixel_values": image.to(self._device)}
+        else:
+            inputs = self._processor(
+                images=image, return_tensors="pt"
+            )
+            inputs = {k: v.to(self._device) for k, v in inputs.items()}
 
         with torch.no_grad():
             image_features = _get_clip_image_features(self._model, inputs)
@@ -139,3 +143,26 @@ class CLIPVisionEncoder(Stage):
 
         output = {idx: query for idx in self.output_queues}
         return output
+
+
+class CLIPImagePreprocess(Stage):
+    """CPU-side CLIP image preprocessing (resize, crop, normalize) as its own
+    stage, so the following encoder stage covers only the device work.
+
+    YAML config example:
+        config:
+          model:
+            name: openai/clip-vit-large-patch14
+
+    Input: query.data=(PIL_image, question_str). Output: query.data=(pixel_values tensor on the CPU, question_str).
+    """
+
+    def __init__(self, stage_config: StageModel, pipeline_config: PipelineModel):
+        super().__init__(stage_config, pipeline_config)
+        self._processor = CLIPProcessor.from_pretrained(self.extra_config["model"]["name"])
+
+    def run(self, query: Query) -> dict[int, Query]:
+        pil_image, question = query.data
+        pixel_values = self._processor(images=pil_image, return_tensors="pt")["pixel_values"]
+        query.data = (pixel_values, question)
+        return {idx: query for idx in self.output_queues}

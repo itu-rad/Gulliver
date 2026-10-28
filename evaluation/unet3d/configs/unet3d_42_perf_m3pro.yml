@@ -1,0 +1,46 @@
+# 3D-UNet on the 42 KiTS19 inference cases: latency pass. Two passes over the
+# cases; the first is warm-up.
+name: 3D-UNet KiTS19 42-case online, perf (m3pro)
+pipelines:
+- name: 3D-UNet KiTS19
+  inputs:
+  - 0
+  outputs:
+  - 2
+  dataset_stage_id: 0
+  loadgen:
+    component: loadgen.OfflineLoadScheduler
+    queue_depth: 1
+    max_queries: 84
+    timeout: 1800000
+    config:
+      rate: 1
+  disable_logs: true
+  stages:
+  - name: KiTS19 case loader
+    id: 0
+    outputs:
+    - 1
+    component: stages.unet3d_kits19.KiTS19CaseLoader
+    disable_logs: true
+    config:
+      raw_data_dir: data/kits19/raw
+      cases_json: evaluation/unet3d/inference_cases.json
+  - name: KiTS19 preprocess
+    id: 1
+    outputs:
+    - 2
+    component: stages.unet3d_kits19.KiTS19Preprocess
+    disable_logs: true
+    config:
+      keep_label: false
+  - name: 3D-UNet sliding-window inference
+    id: 2
+    outputs: []
+    component: stages.unet3d_kits19.UNet3DInference
+    disable_logs: true
+    config:
+      model_path: models/3dunet_kits19/3dunet_kits19_pytorch.ptc
+      device: mps
+  serialize_queries: true
+listeners: []

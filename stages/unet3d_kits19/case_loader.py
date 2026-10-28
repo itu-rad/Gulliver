@@ -8,10 +8,8 @@ from utils.schemas import Query
 class KiTS19CaseLoader(Stage):
     """Source stage for the MLPerf 3D-UNet / KiTS19 medical-segmentation workload.
 
-    Serves one raw case per batch — deliberately LIGHT (it emits only the case
-    id and file paths), so the expensive resample/normalize/pad work happens in
-    the downstream ``KiTS19Preprocess`` stage and is therefore accounted for in
-    Choreo's end-to-end timing (MLPerf excludes it). One query == one CT volume.
+    Emits one case per query (case id and file paths only); loading and
+    preprocessing happen in the downstream ``KiTS19Preprocess`` stage.
 
     YAML config::
 

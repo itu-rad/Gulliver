@@ -1,18 +1,7 @@
 """Lifecycle manager for local inference engine servers (vLLM / Ollama).
 
-A :class:`ServerManager` launches an inference engine as a subprocess inside the
-benchmark's process tree, waits for it to become healthy, and exposes the
-``base_url`` plus the litellm model / api_base wiring that an inference stage
-uses to talk to it. Running the engine as a child process means its GPU and host
-memory are captured by the system-wide RadT listeners.
-
-Guaranteed teardown is the important part: a leaked vLLM process holds the whole
-GPU. The clean path is the owning stage's ``post_run()``, but that may be skipped
-on timeout/crash (bounded thread join in ``pipeline/pipeline.py`` + ``os._exit``
-in ``main.py``). So every live server is tracked in a module-level registry and
-:func:`kill_all` is wired into ``main.py``'s SIGTERM handler and the
-pre-``os._exit`` path, with ``atexit`` covering the remaining normal-shutdown
-cases.
+Live servers are tracked in a registry so :func:`kill_all` can tear them down
+from the SIGTERM handler and before ``os._exit``, when ``post_run()`` is skipped.
 """
 
 from __future__ import annotations
@@ -85,7 +74,8 @@ class _EngineAdapter:
 
 class _VllmAdapter(_EngineAdapter):
     def build_command(self, cfg, port):
-        cmd = ["vllm", "serve", cfg.model, "--host", cfg.host, "--port", str(port)]
+        cmd = [cfg.executable or os.environ.get("VLLM_EXECUTABLE", "vllm"), "serve", cfg.model,
+               "--host", cfg.host, "--port", str(port)]
         if cfg.gpu_memory_utilization is not None:
             cmd += ["--gpu-memory-utilization", str(cfg.gpu_memory_utilization)]
         if cfg.max_model_len is not None:
@@ -100,7 +90,7 @@ class _VllmAdapter(_EngineAdapter):
 
     def litellm_model(self, cfg):
         # vLLM's OpenAI server serves the model under its --served-model-name,
-        # which defaults to the model path we passed on the command line.
+        # which defaults to the model path passed on the command line.
         return f"openai/{cfg.model}"
 
     def litellm_api_base(self, base_url):
@@ -110,7 +100,7 @@ class _VllmAdapter(_EngineAdapter):
 class _OllamaAdapter(_EngineAdapter):
     def build_command(self, cfg, port):
         # `ollama serve` reads host/port from OLLAMA_HOST (set in build_env).
-        return ["ollama", "serve"] + cfg.launch_args
+        return [cfg.executable or "ollama", "serve"] + cfg.launch_args
 
     def build_env(self, cfg, port):
         return {"OLLAMA_HOST": f"{cfg.host}:{port}"}
@@ -126,7 +116,7 @@ class _OllamaAdapter(_EngineAdapter):
         env = dict(os.environ)
         env["OLLAMA_HOST"] = f"{cfg.host}:{port}"
         _logger.info("Ensuring Ollama model is present: %s", cfg.model)
-        subprocess.run(["ollama", "pull", cfg.model], env=env, check=True)
+        subprocess.run([cfg.executable or "ollama", "pull", cfg.model], env=env, check=True)
 
 
 _ADAPTERS: dict[str, type[_EngineAdapter]] = {
@@ -177,6 +167,10 @@ class ServerManager:
             env.update(self._adapter.build_env(self._cfg, self._port))
             env.update(self._cfg.env)
             cmd = self._adapter.build_command(self._cfg, self._port)
+            # An engine installed in another environment finds that environment's
+            # tools (e.g. the ninja vLLM uses for kernel builds) first.
+            if os.path.isabs(cmd[0]):
+                env["PATH"] = os.path.dirname(cmd[0]) + os.pathsep + env.get("PATH", "")
             _logger.info("Launching inference server: %s", " ".join(cmd))
             # start_new_session=True puts the engine in its own process group so
             # killpg() reaps the worker processes vLLM forks, not just the parent.
@@ -235,8 +229,10 @@ class ServerManager:
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
         except (ProcessLookupError, PermissionError):
             proc.terminate()
+        # SIGKILL only as a last resort: force-killing the engine during an active
+        # GPU profiling session can leave the profiler locked.
         try:
-            proc.wait(timeout=15)
+            proc.wait(timeout=float(os.environ.get("SERVER_STOP_TIMEOUT_S", "120")))
         except subprocess.TimeoutExpired:
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)

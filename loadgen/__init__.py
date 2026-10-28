@@ -1,3 +1,5 @@
 from .loadgen import run_loadgen
 from .schedulers.offline_scheduler import OfflineLoadScheduler
 from .schedulers.poisson_scheduler import PoissonLoadScheduler
+from .schedulers.saturating_offline_scheduler import SaturatingOfflineScheduler
+from .schedulers.multistream_scheduler import MultiStreamScheduler

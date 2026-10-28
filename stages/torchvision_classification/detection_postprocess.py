@@ -6,9 +6,7 @@ from utils.schemas import Query, StageModel, PipelineModel
 
 
 class DetectionPostprocess(Stage):
-    """TorchVision stage for preprocessing. The preprocessing steps stem from the
-    preprocessing pipeline associated with the pretrained weights of a TorchVision model.
-    """
+    """Scores TorchVision detection outputs against the expected classes."""
 
     def __init__(self, stage_config: StageModel, pipeline_config: PipelineModel):
         """Initialize the stage by parsing the stage configuration.
@@ -25,7 +23,6 @@ class DetectionPostprocess(Stage):
         super().prepare()
 
     def run(self, query: Query) -> dict[int, Query]:
-        # no postprocessing necessary for training
         if query.split == "train":
             return {idx: query for idx in self.output_queues}
 
@@ -41,7 +38,6 @@ class DetectionPostprocess(Stage):
         total = 0
 
         processed_results = []
-        # batch size
         bs = len(results[0])
         for idx in range(0, bs):
             processed_results.append([])
@@ -56,10 +52,7 @@ class DetectionPostprocess(Stage):
                 if detection_class in expected_classes:
                     good += 1
                 box = detection_boxes[detection]
-                # box comes from model as: xmin, ymin, xmax, ymax
-                # box comes with dimentions in the range of [0, height]
-                # and [0, width] respectively. It is necesary to scale
-                # them in the range [0, 1]
+                # The model returns boxes as xmin, ymin, xmax, ymax.
                 processed_results[idx].append(
                     [
                         box[1].item(),

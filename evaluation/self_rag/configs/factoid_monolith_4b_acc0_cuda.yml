@@ -1,0 +1,116 @@
+name: "Self-RAG Monolith 4B \u2014 single call (factoid, CUDA)"
+listeners:
+- dcgmi
+- top
+pipelines:
+- name: Self-RAG Monolith 4B
+  inputs:
+  - 0
+  outputs:
+  - 5
+  dataset_stage_id: 0
+  loadgen:
+    component: loadgen.OfflineLoadScheduler
+    queue_depth: 1
+    max_queries: 60
+    timeout: 3600000
+    config:
+      rate: 0
+  stages:
+  - name: Question dataloader
+    id: 0
+    outputs:
+    - 1
+    component: stages.self_rag.SelfRAGDataLoader
+    config:
+      batch_size: 1
+      dataset:
+        name: rag-datasets/rag-mini-wikipedia
+        subset: question-answer
+        split: test
+        question_column: question
+        answers_column: answer
+        offset: 0
+        stride: 15
+  - name: Document retriever
+    id: 1
+    outputs:
+    - 2
+    component: stages.self_rag.ChromaRetriever
+    polling_policy: utils.queues.polling.FirstSubmittedPolicy
+    config:
+      corpus_dataset:
+        name: rag-datasets/rag-mini-wikipedia
+        subset: text-corpus
+        split: passages
+        text_column: passage
+        max_docs: 3200
+      top_k: 5
+      embedding_model: intfloat/e5-base-v2
+      query_prefix: 'query: '
+      passage_prefix: 'passage: '
+      collection_name: self_rag_factoid_monolith_corpus
+  - name: Monolith formatter
+    id: 2
+    outputs:
+    - 3
+    component: stages.self_rag.MonolithFormatter
+    config:
+      tokenizer_stage_id: 3
+      enable_thinking: false
+  - name: Monolith LLM
+    id: 3
+    outputs:
+    - 4
+    component: stages.llm_huggingface.Inference
+    config:
+      dtype: torch.bfloat16
+      device: cuda
+      model:
+        name: Qwen/Qwen3.5-4B
+        quantize: false
+        gen_kwargs:
+          max_new_tokens: 256
+          do_sample: false
+        thinking_budget: 0
+  - name: Monolith router
+    id: 4
+    outputs:
+    - 5
+    - 6
+    component: stages.self_rag.MonolithRouter
+    config:
+      accept_stage_id: 5
+      retry_stage_id: 6
+      end_stage_id: 5
+      max_retries: 2
+  - name: End stage
+    id: 5
+    component: stages.TerminalCapture
+    polling_policy: utils.queues.polling.FirstSubmittedPolicy
+  - name: Query rewrite formatter
+    id: 6
+    outputs:
+    - 7
+    component: stages.self_rag.QuestionRewriterFormatter
+    config:
+      tokenizer_stage_id: 3
+      doc_chars: 1500
+      enable_thinking: false
+  - name: Query rewrite LLM
+    id: 7
+    outputs:
+    - 1
+    component: stages.llm_huggingface.Inference
+    config:
+      dtype: torch.bfloat16
+      device: cuda
+      model:
+        name: Qwen/Qwen3.5-4B
+        quantize: false
+        gen_kwargs:
+          max_new_tokens: 128
+          do_sample: false
+        thinking_budget: 0
+      depends_on_id: 3
+  serialize_queries: true

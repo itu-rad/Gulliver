@@ -1,4 +1,5 @@
 import logging
+import os
 import threading
 import time
 from logging.handlers import QueueHandler
@@ -7,6 +8,7 @@ from queue import Queue
 import multiprocessing
 
 import mlflow
+from utils.trace_span import trace_span
 
 from loadgen.schedulers.scheduler import LoadScheduler
 from pipeline import Pipeline
@@ -15,7 +17,7 @@ from utils.schemas import PipelineModel
 from utils.tracing import flush_traces
 
 
-def run_loadgen(pipeline_config: PipelineModel) -> None:
+def run_loadgen(pipeline_config: PipelineModel, stop_marker: str | None = None) -> None:
     """
     Initialization and invokation of LoadGen. Initialization is necessary after process
     creation, because fork is not the default start method on all platforms (spawn does
@@ -23,11 +25,10 @@ def run_loadgen(pipeline_config: PipelineModel) -> None:
 
     Args:
         pipeline_config (PipelineModel): Pipeline configuration (parsed from YAML file)
+        stop_marker (str): stop generating load once this file exists
     """
     loadgen = LoadGen(pipeline_config)
-    # TODO: Write this to a .md file
-    print(loadgen)
-    loadgen.run()
+    loadgen.run(stop_marker)
 
 
 class LoadGen:
@@ -39,12 +40,10 @@ class LoadGen:
     def __init__(self, pipeline_config: PipelineModel):
         self._pipeline_config = pipeline_config
 
-        # initialize the pipeline and all pipeline stages
         self._pipeline = Pipeline(pipeline_config)
         self._pipeline.prepare()
         dataset_splits = self._pipeline.get_dataset_splits()
 
-        # parse the loadgen scheduler config and initialize the appropriate scheduler
         loadgen_config = pipeline_config.loadgen
         load_scheduler_config = loadgen_config.config
         self._load_scheduler: LoadScheduler = get_component(loadgen_config.component)(
@@ -55,14 +54,11 @@ class LoadGen:
         )
         self._load_scheduler.prepare()
 
-        # set up queue for passing queries from the loadgen to the pipeline
         sample_queue = Queue(maxsize=loadgen_config.queue_depth)
 
-        # set up a conditional variable for synchronization between the pipeline
-        # execution and load generation (where necessary, i.e. offline scheduler)
+        # Signals query completions to schedulers that pace on them.
         event = Event()
 
-        # set up the pipeline and scheduler threads
         self.pipeline_thread = Thread(
             target=self._pipeline.run, args=[sample_queue, event]
         )
@@ -76,26 +72,34 @@ class LoadGen:
         s += str(self._pipeline)
         return s
 
-    def run(self) -> None:
+    def _stop_on(self, marker: str) -> None:
+        while self.scheduler_thread.is_alive():
+            if os.path.exists(marker):
+                print(f"{os.path.basename(marker)} finished; stopping load generation", flush=True)
+                self._load_scheduler.stop = True
+                return
+            time.sleep(0.5)
+
+    def run(self, stop_marker: str | None = None) -> None:
         """
         Start the pipeline and load generation threads and join them
         after execution is finished.
 
         The execution is stopped when the max_queries is reached or timer elapses.
         """
-        with mlflow.start_span(
+        with trace_span(
             name="LoadGen.run",
             attributes={"thread_id": threading.get_ident()},
         ):
             start_time = time.perf_counter()
             self.pipeline_thread.start()
             self.scheduler_thread.start()
+            if stop_marker:
+                Thread(target=self._stop_on, args=[stop_marker], daemon=True).start()
             self.scheduler_thread.join()
             self.pipeline_thread.join()
             duration = time.perf_counter() - start_time
             print(f"Pipeline execution completed in {duration:.2f} seconds", flush=True)
 
-        # Drain spans synchronously now that both threads have joined. main.py
-        # follows up with os._exit(0), which skips atexit handlers — if we
-        # don't flush here, the last query's spans never reach the backend.
+        # main.py exits with os._exit, which skips atexit handlers, so flush here.
         flush_traces()

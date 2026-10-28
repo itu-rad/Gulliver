@@ -1,0 +1,68 @@
+# Plain RAG serving with generation on a local Ollama server (continuous batching).
+name: "RAG serve (Ollama)"
+pipelines:
+  - name: RAG serve Ollama
+    inputs: [0]
+    outputs: [4]
+    dataset_stage_id: 0
+    loadgen:
+      component: loadgen.PoissonLoadScheduler
+      queue_depth: 100
+      max_queries: 100
+      timeout: 2256
+      config:
+        rate: 0.2243
+    stages:
+      - name: Question dataloader
+        id: 0
+        outputs: [1]
+        component: stages.self_rag.SelfRAGDataLoader
+        config:
+          batch_size: 1
+          dataset:
+            name: rag-datasets/rag-mini-wikipedia
+            subset: question-answer
+            split: test
+            question_column: question
+            answers_column: answer
+
+      - name: Document retriever
+        id: 1
+        outputs: [2]
+        component: stages.self_rag.ChromaRetriever
+        config:
+          corpus_dataset:
+            name: rag-datasets/rag-mini-wikipedia
+            subset: text-corpus
+            split: passages
+            text_column: passage
+            max_docs: 3200
+          top_k: 3
+          collection_name: rag_serve_plain_corpus
+
+      - name: Answer formatter
+        id: 2
+        outputs: [3]
+        component: stages.self_rag.AnswerGeneratorFormatter
+        config:
+          tokenizer_stage_id: 3
+
+      - name: Generator LLM
+        id: 3
+        outputs: [4]
+        component: stages.llm_server.Inference
+        config:
+          concurrency: 8
+          tokenizer_name: Qwen/Qwen3.5-4B
+          server:
+            engine: ollama
+            model: qwen3.5:4b
+            port: 0
+          model:
+            gen_kwargs:
+              do_sample: false
+              max_new_tokens: 128
+
+      - name: End stage
+        id: 4
+        component: stages.TerminalCapture

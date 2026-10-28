@@ -1,29 +1,7 @@
-"""Orchestrator watchdog: bounded cleanup for the RadT post-loop hang.
+"""Watchdog that cleans up if ``radt.schedule_external`` hangs after the workload.
 
-Why this exists
----------------
-``radt.schedule_external`` runs the workload, then in its post-loop
-section uploads its captured stdout/stderr via ``client.log_text`` HTTPS
-calls. When the tracking server's idle-connection timeout has fired
-mid-pipeline, those calls hang on stale pooled connections; with MLflow's
-default 7-retry policy a single ``log_text`` can take ~16 minutes to
-fail, and RadT does two such calls per pipeline — so the orchestrator
-stays alive for ~30 minutes after the actual work is done.
-
-While it's hung:
-  * The parent run sits in ``RUNNING`` state.
-  * The orchestrator's RadT listener subprocesses (``macmon pipe``,
-    ``smi``, ``top``, …) are orphaned and keep running.
-  * If the user CTRL-C's, the listener subprocesses leak forever and
-    eventually degrade the host.
-
-This watchdog detects "the workload is genuinely done" by polling MLflow
-for the state of our pipeline child runs, gives ``schedule_external`` a
-short grace period to drain on its own, and otherwise force-cleans up.
-
-It runs in a daemon thread so a normal completion (``schedule_external``
-returns before the workload runs are all FINISHED — unusual but possible)
-just kills the watchdog when ``main()`` exits.
+Once every pipeline child run is terminal and a grace period has passed, it
+finalizes the parent run, reaps radT listener processes and exits.
 """
 
 from __future__ import annotations
@@ -41,9 +19,8 @@ import psutil
 _LOGGER = logging.getLogger(__name__)
 
 
-# Tool names spawned by RadT listeners. We only reap processes whose
-# command line contains one of these AND that were started after our
-# orchestrator began (so we never kill the user's pre-existing processes).
+# Tool names spawned by radT listeners. Only processes matching one of these
+# and started after the orchestrator are reaped.
 _LISTENER_TOKENS = (
     "macmon",
     "nvidia-smi",
@@ -57,9 +34,7 @@ def _call_with_timeout(fn, timeout_s: float, *args, **kwargs):
     """Run ``fn(*args, **kwargs)`` in a worker thread and wait up to ``timeout_s``.
 
     Returns the result on success, or raises ``TimeoutError`` if the
-    worker doesn't finish in time. Used to keep the watchdog itself from
-    being subject to the same MLflow HTTPS hangs it's trying to work
-    around.
+    worker doesn't finish in time.
     """
     holder: dict[str, object] = {}
 
@@ -88,16 +63,14 @@ class OrchestratorWatchdog:
         pipeline_names: list of pipeline names; RadT names their child
             runs as ``"(0 0) <pipeline name>"``.
         process_start_time: ``time.time()`` at orchestrator start. Used
-            to filter MLflow runs and process scans so we don't touch
-            anything that predates this invocation.
+            to ignore MLflow runs and processes that predate this invocation.
         poll_interval_s: how often to poll MLflow for child run state.
         grace_period_s: after every child is terminal, wait this long
             for ``schedule_external`` to return naturally before forcing.
         absolute_deadline_s: never run longer than this even if children
             never reach terminal state (e.g. they never started).
-        mlflow_call_timeout_s: per-MLflow-call timeout INSIDE the
-            watchdog — we don't want the watchdog itself to hang on the
-            very problem it's trying to work around.
+        mlflow_call_timeout_s: timeout for each MLflow call made by the
+            watchdog.
     """
 
     def __init__(
@@ -161,9 +134,7 @@ class OrchestratorWatchdog:
                 break
             time.sleep(self.poll_interval_s)
         else:
-            # Hit the absolute deadline without ever seeing all children
-            # terminal. Force cleanup anyway — something is seriously wrong
-            # (e.g. pipelines never started) and we don't want to leak.
+            # Deadline reached without all children terminal; clean up anyway.
             print(
                 f"[watchdog] absolute deadline ({self.absolute_deadline_s}s) reached "
                 f"without all children terminal — forcing cleanup",
@@ -204,8 +175,7 @@ class OrchestratorWatchdog:
                   file=sys.stderr, flush=True)
             return False
 
-        # Find each expected pipeline name as either "(0 0) <name>" (RadT
-        # child run) or "<name>" (in case the prefix format ever changes).
+        # Match "(0 0) <name>" (radT child run naming) or plain "<name>".
         found: dict[str, str] = {}
         for r in runs or []:
             name = r.info.run_name or ""
@@ -218,8 +188,7 @@ class OrchestratorWatchdog:
         return all(s in ("FINISHED", "FAILED", "KILLED") for s in found.values())
 
     def _search_runs(self):
-        # Local import: avoid taking the mlflow dependency just to load
-        # this module (helps unit testing too).
+        # Local import: the module can be loaded without mlflow.
         import mlflow  # pylint: disable=import-outside-toplevel
 
         client = mlflow.MlflowClient()
@@ -236,8 +205,7 @@ class OrchestratorWatchdog:
     def _force_cleanup(self) -> None:
         self._finalize_parent_run()
         self._reap_listener_processes()
-        # Hard-exit so we don't get stuck in Python interpreter shutdown
-        # on the same pooled HTTPS sockets that hung schedule_external.
+        # Hard-exit: interpreter shutdown can hang on the same HTTPS sockets.
         os._exit(0)
 
     def _finalize_parent_run(self) -> None:
@@ -279,9 +247,8 @@ class OrchestratorWatchdog:
     def _reap_listener_processes(self) -> int:
         """Kill orphaned RadT listener subprocesses started during this run.
 
-        Conservative match: command line contains a listener tool name
-        AND ``create_time`` is at or after our orchestrator start. We
-        never touch a process that predates this invocation.
+        A process matches if its command line contains a listener tool name
+        and it was created at or after the orchestrator start.
         """
         killed = 0
         try:
@@ -307,8 +274,7 @@ class OrchestratorWatchdog:
             return killed
 
         if killed:
-            # SIGTERM may not be enough for tools like macmon that ignore it.
-            # Give a brief moment, then SIGKILL anything still alive.
+            # Some tools ignore SIGTERM; SIGKILL anything still alive.
             time.sleep(2)
             for proc in psutil.process_iter(["cmdline", "create_time"]):
                 try:

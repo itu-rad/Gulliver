@@ -130,24 +130,26 @@ def explode_spans_content(spans_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _get_perfetto_flow_id(flow_uuid_str: Optional[str]) -> Optional[int]:
-    """Converts a UUID string to a Perfetto-compatible 64-bit unsigned flow ID.
+    """Converts a flow id to a Perfetto-compatible 63-bit flow ID.
+
+    Flow ids are opaque strings (uuid4 from the load schedulers, counter-based
+    ids from utils.trace_span.new_flow_id). A UUID keeps its lower bits;
+    anything else is hashed.
 
     Args:
-        flow_uuid_str: The flow UUID string.
+        flow_uuid_str: The flow id string.
 
     Returns:
-        A 64-bit integer representation of the UUID, or None if invalid.
+        A 63-bit integer, or None if empty.
     """
     if pd.isna(flow_uuid_str) or not flow_uuid_str:
         return None
     try:
-        # Create a UUID object from the string
-        u = uuid.UUID(flow_uuid_str)
-        # Convert to 64-bit integer (take lower 64 bits)
-        return u.int & ((1 << 63) - 1)
+        return uuid.UUID(flow_uuid_str).int & ((1 << 63) - 1)
     except ValueError:
-        logger.warning(f"Invalid flow UUID: {flow_uuid_str}")
-        return None
+        import hashlib
+        h = hashlib.blake2b(str(flow_uuid_str).encode(), digest_size=8).digest()
+        return int.from_bytes(h, "big") & ((1 << 63) - 1)
 
 
 def _flatten_dict(
@@ -213,7 +215,7 @@ def _generate_process_and_thread_tracks(
     proc_packet = builder.add_packet()
     proc_packet.track_descriptor.uuid = uuid.uuid4().int & ((1 << 63) - 1)
     proc_packet.track_descriptor.process.pid = PROCESS_PID
-    proc_packet.track_descriptor.process.process_name = "Colocation Benchmark"
+    proc_packet.track_descriptor.process.process_name = "Gulliver"
 
     # Emit TrackDescriptors first in the correct order
     for i, (_, row) in enumerate(thread_order_df.iterrows()):
@@ -336,8 +338,7 @@ def _add_metric_events(builder: TraceProtoBuilder, metrics_df: pd.DataFrame) -> 
     logger.info(f"Processing {len(metrics_df)} metric rows...")
     TRUSTED_PACKET_SEQUENCE_ID = 42
 
-    # Convert timestamp from ms to ns
-    # Avoid SettingWithCopyWarning by creating a copy or assigning directly safely
+    # Convert timestamp from ms to ns; copy to avoid SettingWithCopyWarning.
     metrics_df = metrics_df.copy()
     metrics_df["timestamp_ns"] = (metrics_df["timestamp"] * 1000000).astype(np.int64)
 
@@ -353,8 +354,7 @@ def _add_metric_events(builder: TraceProtoBuilder, metrics_df: pd.DataFrame) -> 
         packet = builder.add_packet()
         packet.track_descriptor.uuid = track_uuid
         packet.track_descriptor.name = key
-        # Mark it as a counter track. unit_name is optional.
-        # We assume double values for metrics.
+        # Counter track; metric values are emitted as doubles.
         packet.track_descriptor.counter.unit_name = "value"
 
     # Emit Counter Events

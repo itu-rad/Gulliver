@@ -1,56 +1,42 @@
-# Versions pinned to the verified-working paper env (`benchmark_nvidia`):
-# transformers 5.2.0, torchaudio 2.10.0 (matching torch 2.10.0), mlflow 3.10.0,
-# etc. Only the packages already listed here are pinned -- pip still resolves
-# transitive deps. The previously un-pinned entries (esp. torchaudio,
-# transformers) drifted to incompatible versions on fresh installs and broke all
-# model loading; see REPLICATION_NOTES.md.
-name: benchmark_nvidia
+# NVIDIA (CUDA 13, aarch64 or x86_64). radT is installed separately, see README.md.
+name: gulliver_nvidia
 dependencies:
   - python=3.10.19
   - pip
   - pip:
-    # On DGX Spark (GB10, sm_121 / aarch64) the default `torch` wheel is
-    # CPU-only. Pull the CUDA build from the cu130 index instead.
     - --extra-index-url https://download.pytorch.org/whl/cu130
 
-    # RadT dependencies
+    # radT dependencies
     - tensorflow==2.20.0
     - tensorboardX==2.6.4
-    - mlflow==3.10.0
+    - mlflow==3.15.1
     - boto3==1.42.57
     - psutil==7.2.2
-    - radt==0.2.28              # paper env used a local checkout reporting 0.2.28; pinned to PyPI
 
-    # Tracing + Perfetto export
+    # Tracing and Perfetto export
     - sqlalchemy==2.0.47
     - pandas==2.3.3
-    - psycopg2-binary==2.9.12   # not present in paper env; version from a clean validated build
-    - perfetto==0.56.0          # not present in paper env; version from a clean validated build
+    - psycopg2-binary==2.9.12
+    - perfetto==0.56.0
 
-    # benchmark dependencies
-    ## general
-    - torch==2.10.0+cu130       # GB10: CUDA build (plain `torch` is CPU-only here)
+    # Framework and stages
+    - torch==2.10.0+cu130
     - torchvision==0.25.0+cu130
-    - torchaudio==2.10.0        # MUST match torch 2.10; un-pinned drifts to 2.11 and breaks transformers
+    - torchaudio==2.10.0+cu130
     - torchtune==0.6.1
+    - torchao==0.11.0
     - transformers==5.2.0
+    - accelerate==1.14.0
+    - bitsandbytes==0.49.2
     - datasets==4.6.0
     - peft==0.18.1
     - pydantic_yaml==1.6.0
     - outlines==1.2.11
-    - tf-keras==2.20.1 # for compatibility between transformers and tensorflow
-
-    ## Self-RAG case study
+    - tf-keras==2.20.1
     - chromadb==1.5.9
-
-    ## local inference engines (stages.llm_server)
-    # litellm is the OpenAI-compatible client used to talk to the local server.
-    - litellm
-    # vLLM provides the dynamic/continuous-batching server. NOTE: verify the
-    # wheel builds/serves on this GB10 (aarch64, sm_121 / cu130) box — it may
-    # need a specific nightly or a source build. Ollama (external binary) is
-    # the cross-platform fallback and needs no pip dependency.
-    - vllm
-
-    ## nvidia specific
-    # possibly TensorRT or other NVIDIA/CUDA specific dependencies
+    - sentence-transformers==5.6.0
+    - litellm==1.92.0
+    - nibabel==5.4.2
+    - scipy==1.15.3
+    - Pillow==12.3.0
+    - mlcommons_loadgen==6.0.16

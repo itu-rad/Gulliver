@@ -4,6 +4,7 @@ from queue import Queue
 import threading
 
 import mlflow
+from utils.trace_span import trace_span
 
 from utils.schemas import Query
 from .scheduler import LoadScheduler
@@ -21,29 +22,25 @@ class OfflineLoadScheduler(LoadScheduler):
             event (threading.Event): Conditional variable for synchronizing between the load generation and the pipeline's execution.
         """
         counter = 0
-        # start the timeout timer
         self.timer.start()
 
         print("Starting load generation")
         print("Splits: ", self.dataset_splits)
 
         try:
-            # terminate when max_queries is reached
             while counter < self.max_queries:
                 for split_name, split_batches in self.dataset_splits.items():
                     for batch_idx in range(split_batches):
-                        # look for a timeout
                         if self.stop:
                             break
 
-                        # wait for the pipeline execution to finish
-                        # wait only when we have already pushed something (counter > 0)
+                        # Wait for the previous query to complete.
                         if counter > 0:
                             event.wait()
                             event.clear()
 
                         flow_id = uuid.uuid4()
-                        with mlflow.start_span(
+                        with trace_span(
                             name="generate query",
                             attributes={
                                 "out_flow_id": str(flow_id),
@@ -53,7 +50,6 @@ class OfflineLoadScheduler(LoadScheduler):
                                 "split": split_name,
                             },
                         ):
-                            # push the query onto queue
                             queue.put_nowait(
                                 Query(
                                     split=split_name,
@@ -63,19 +59,15 @@ class OfflineLoadScheduler(LoadScheduler):
                                 )
                             )
 
-                        # increment the counter and check if exceeds the max_queries
                         counter += 1
                         if counter >= self.max_queries:
                             self.stop = True
                             break
-                    # propagate the stop signal
                     if self.stop:
                         break
-                # propagate the stop signal
                 if self.stop:
                     break
         finally:
-            # Always send terminator and cancel the timer, even on exception,
-            # so downstream stages don't hang and we don't leak a Timer thread.
+            # Always send the terminator and cancel the timer, even on exception.
             queue.put(None)
             self.timer.cancel()

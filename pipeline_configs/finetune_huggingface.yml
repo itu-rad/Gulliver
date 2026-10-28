@@ -1,3 +1,4 @@
+# Fine-tune a causal LM with Hugging Face Transformers.
 name: "phi3_alpaca_qlora_finetune_huggingface"
 listeners:
   - smi

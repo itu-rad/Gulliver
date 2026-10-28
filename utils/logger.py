@@ -1,69 +1,24 @@
-import glob
 import logging
 from logging.handlers import QueueListener
 import os
 import re
-import sys
 import time
 
 
-# The trace's first column stays wall-clock (``%(created)`` = ``time.time()``)
-# because RadT aligns host-listener samples and cross-process/cross-pipeline
-# spans on wall-clock. Wall-clock is, however, unsuitable for microsecond-scale
-# per-stage latency: it is not monotonic (NTP slew) and its resolution varies.
-# We therefore stamp every LogRecord with a monotonic ``perf_counter_ns`` at the
-# moment the record is created -- the same instant ``created`` is set, inside the
-# record factory -- and emit it as the trailing column. Stages of one pipeline
-# run as threads in one process, so this clock is monotonic and directly
-# comparable across stages within a pipeline (exactly the quantity per-stage
-# latency needs); it is process-local and never used for cross-process work.
+# Trace CSV row: wall-clock time (used to align with radT listener samples
+# across processes), the message, and a process-local monotonic
+# perf_counter_ns for per-stage latency.
 PERF_FORMAT = "%(created)f, %(message)s, %(perf)d"
 
 _perf_clock_installed = False
 
 
-def upload_run_outputs(run_id, log_file, artifact_path="results"):
-    """Attach everything a finished run wrote to its mlflow run.
-
-    Every output is named from the run's label -- the timing CSV, the
-    TerminalCapture JSONL, and anything a stage adds later -- so a prefix glob
-    picks them all up without enumerating names.
-
-    Uses the client rather than the fluent API because the run is already
-    closed by the time the log file is. Never raises: this is the last thing
-    before ``os._exit``, and losing outputs must not lose the run.
-
-    Returns the number of files uploaded.
-    """
-    if not run_id or not log_file:
-        return 0
-
-    from mlflow.tracking import MlflowClient
-
-    directory = os.path.dirname(log_file) or "."
-    stem = os.path.splitext(os.path.basename(log_file))[0]
-
-    client = MlflowClient()
-    uploaded = 0
-    for path in sorted(glob.glob(os.path.join(directory, stem + "*"))):
-        if not os.path.isfile(path):
-            continue
-        try:
-            client.log_artifact(run_id, path, artifact_path=artifact_path)
-            uploaded += 1
-        except Exception as exc:  # pylint: disable=broad-except
-            print(f"[logger] failed to upload {path}: {exc}", file=sys.stderr, flush=True)
-    return uploaded
-
-
 def install_perf_clock():
     """Install a LogRecord factory that adds ``record.perf`` (perf_counter_ns).
 
-    Idempotent and process-global: must be called once per process (the pipeline
-    subprocess and the orchestrator) before any record is formatted with
-    ``PERF_FORMAT``. Stamping in the factory (vs. a handler filter) means ``perf``
-    is set at record-creation time with no handler/queue lag and survives pickling
-    through the multiprocessing log queue.
+    Idempotent; must be called in every process before any record is formatted
+    with ``PERF_FORMAT``. The stamp is taken at record creation and survives
+    pickling through the multiprocessing log queue.
     """
     global _perf_clock_installed
     if _perf_clock_installed:
@@ -114,20 +69,18 @@ class Logger:
 
         install_perf_clock()
         formatter = logging.Formatter(PERF_FORMAT)
-        # formatter = logging.Formatter("%(name)-12s: %(levelname)-8s %(message)s")
 
-        # Create filter to only allow logs from benchmark logger
         benchmark_filter = BenchmarkFilter()
 
         stream_handler = logging.StreamHandler()
         stream_handler.setFormatter(formatter)
-        # stream_handler.addFilter(benchmark_filter)
 
         # make benchmark name filename-safe
         benchmark_name = benchmark_name.lower()
         benchmark_name = re.sub(r"\s", "_", benchmark_name)
         benchmark_name = re.sub(r"[^\w_]+", "", benchmark_name)
-        log_dir = os.path.join(os.getcwd(), "tmp")
+        # Same output directory variable as main.py.
+        log_dir = os.environ.get("SUITE_OUTPUT_DIR") or os.path.join(os.getcwd(), "tmp")
         os.makedirs(log_dir, exist_ok=True)
         file_handler = logging.FileHandler(
             filename=os.path.join(log_dir, f"{benchmark_name}.csv")
@@ -135,13 +88,11 @@ class Logger:
         file_handler.setFormatter(formatter)
         file_handler.addFilter(benchmark_filter)
 
-        # queue_listener gets records from the queue and sends them to the handler
         self.queue_listener = QueueListener(self.queue, stream_handler, file_handler)
         self.queue_listener.start()
 
         logger = logging.getLogger("benchmark")
         logger.setLevel(logging.DEBUG)
-        # add the handler to the logger so records from this process are handled
         logger.addHandler(stream_handler)
         logger.addHandler(file_handler)
 

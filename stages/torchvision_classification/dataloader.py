@@ -1,6 +1,6 @@
+import logging
 import os
-from re import split
-from turtle import width
+import torch
 from torch.utils.data import DataLoader
 from torchvision.transforms import v2
 from torchvision.models import get_weight
@@ -43,6 +43,17 @@ def transform_openimages(split):
                 v2.ToTensor(),
             ]
         )
+
+
+def order_fingerprint(batch, seed, epoch, n=16):
+    """`epoch<e>_seed<s>_<labels>` for the first batch of an epoch: the first n
+    labels, joined by '-'. Comma-free, and enough to tell two shuffles apart."""
+    labels = batch[1] if isinstance(batch, (list, tuple)) else batch
+    try:
+        labs = [int(v) for v in labels[:n].tolist()]
+    except Exception:
+        labs = []
+    return f"epoch{epoch}_seed{'none' if seed is None else seed}_" + "-".join(map(str, labs))
 
 
 class TorchVisionDataLoader(Stage):
@@ -99,15 +110,18 @@ class TorchVisionDataLoader(Stage):
             for x in self._splits
         }
 
-        # if dataset_name.lower() == "openimages":
-        #     for split in self._datasets:
-        #         self._datasets[split] = wrap_dataset_for_transforms_v2(
-        #             self._datasets[split], target_keys=["boxes", "labels", "image_id"]
-        #         )
-
         self._batch_size = self.extra_config.get("batch_size", 1)
         self._dataloaders = {}
         self._dataloader_iter = None
+        # Optional deterministic shuffle: epoch e seeds torch with seed + e just
+        # before building the iterator, so any process seeding the same way
+        # loads the same batches in the same order. SUITE_DATA_SEED overrides
+        # the config key.
+        env_seed = os.environ.get("SUITE_DATA_SEED")
+        self._seed = (int(env_seed) if env_seed not in (None, "")
+                      else self.extra_config.get("seed", None))
+        if self._seed is not None:
+            self._seed = int(self._seed)
 
     def get_dataset_splits(self) -> dict[str, int]:
         """Get the number of batches for each dataset split.
@@ -119,11 +133,9 @@ class TorchVisionDataLoader(Stage):
 
     def _preload_dataset(self) -> None:
         for key in self._datasets.keys():
-            # get the old transform
+            # Cache the untransformed samples and apply the transform on access.
             transform = self._datasets[key].transform
-            # remove transform from preloading
             self._datasets[key].transform = None
-            # add transform to cached dataset
             self._datasets[key] = PreloadedDataset(self._datasets[key], transform)
 
     @staticmethod
@@ -138,7 +150,6 @@ class TorchVisionDataLoader(Stage):
         """Build the dataloaders."""
         super().prepare()
 
-        # preload the dataset if necessary
         if self.extra_config.get("preload", False):
             self._preload_dataset()
 
@@ -170,9 +181,16 @@ class TorchVisionDataLoader(Stage):
 
     def run(self, query: Query) -> dict[int, Query]:
         if query.batch == 0:
+            if self._seed is not None:
+                torch.manual_seed(self._seed + query.epoch)
             self._dataloader_iter = iter(self._dataloaders[query.split])
         next_batch = next(self._dataloader_iter)
-        # print(f"Batch: {next_batch}")
+        if query.batch == 0:
+            # Log the epoch's order fingerprint regardless of disable_logs, so
+            # runs can be checked for identical data order.
+            fp = order_fingerprint(next_batch, self._seed, query.epoch)
+            logging.getLogger("benchmark").info(
+                "%s, %s, order, %s", self.parent_name, self.name, fp)
         query.data = next_batch
         output = {idx: query for idx in self.output_queues}
         return output

@@ -1,13 +1,16 @@
 import logging
+import os
 import threading
-import uuid
-from queue import Queue, Empty
-from threading import Event, Thread
+from queue import Queue, Full, Empty
+from threading import Condition, Event, Thread
+from time import monotonic
 
 import mlflow
+from utils.trace_span import trace_span, SPANS_ENABLED, new_flow_id
 
 from stages import Stage
 from utils.component import get_stage_component
+from utils.queues import PeekableQueue
 from utils.schemas import PipelineModel, StageModel, Query
 
 
@@ -25,11 +28,24 @@ class Pipeline:
         self._logger = logging.getLogger("benchmark")
         self._pipeline_config = pipeline_config
         self.name = self._pipeline_config.name
+        # Pipeline-level twin of the Stage flag; see PipelineModel.disable_logs.
+        self._disable_logs = bool(getattr(pipeline_config, "disable_logs", False))
         stage_config = pipeline_config.stages
         stage_config_dict = {stage.id: stage for stage in stage_config}
 
         self._input_queues: list[Queue] = []
-        self._output_queues: list[Queue] = []
+        self._output_queues: list[PeekableQueue] = []
+        # One terminator flag per output queue -- see _next_result.
+        self._outputs_drained: list[bool] = []
+
+        # Signalled by PeekableQueue.put on every output queue; the result
+        # collector waits on it instead of polling.
+        self._output_cond = Condition()
+
+        # Guards queries_processed and wakes _wait_for_drain. Separate from
+        # _output_cond so the collector never holds the producers' condition.
+        self._drain_cond = Condition()
+        self.queries_processed = 0
 
         self.stages = self._create_stages(stage_config_dict)
 
@@ -103,9 +119,12 @@ class Pipeline:
 
         # create output queue for each output stage of the pipeline and pass it to the output stage
         for output_stage_idx in self._pipeline_config.outputs:
-            queue = Queue()
+            # PeekableQueue notifies _output_cond after each put. Unbounded:
+            # an output stage must never block pushing a result.
+            queue = PeekableQueue(notify_condition=self._output_cond)
             self._output_queues.append(queue)
             self.stages[output_stage_idx].set_output_queue(queue)
+        self._outputs_drained = [False] * len(self._output_queues)
 
         # start the stage threads
         for stage in self.stages.values():
@@ -113,56 +132,83 @@ class Pipeline:
 
         self._logger.info("%s, pipeline, prepare, end", self.name)
 
+    def _broadcast_terminator(self) -> None:
+        """Put the None terminator on every input queue of every stage.
+
+        Propagating it from the pipeline inputs alone does not terminate cyclic
+        graphs. Must only be called after the pipeline has drained.
+        """
+        for stage in self.stages.values():
+            for queue_ in stage._input_queues.values():
+                try:
+                    queue_.put_nowait(None)
+                except Full:
+                    # The pipeline did not drain; do not block shutdown.
+                    self._logger.warning(
+                        "pipeline %s: input queue of stage %r was full at "
+                        "shutdown; its terminator was not delivered",
+                        self.name, stage.name)
+
     def join_threads(self, timeout: float | None = None) -> None:
         """
         Wait for all the stage threads to finish, with optional per-stage timeout.
 
-        Bounded join prevents a stuck stage from holding the whole pipeline
-        in shutdown forever. The caller (typically `main.py`) is expected
-        to force-exit the process after this returns so any straggler
-        threads are reclaimed.
+        The caller is expected to force-exit the process afterwards so any
+        straggler threads are reclaimed.
         """
         for stage in self.stages.values():
             stage._thread.join(timeout=timeout)
 
-    def retrieve_results(self, event: Event) -> None:
+    def _next_result(self) -> int | None:
+        """Block until some output queue has a result; return its index.
+
+        Returns None once every output queue has delivered its terminator.
+        The condition is held across the scan, so a concurrent put cannot be
+        missed; the wait timeout is only a safety net.
         """
-        This method continuously checks all output queues for new queries. It performs
-        non-blocking retrieval from the queues and processes the queries if available.
-        If a terminating character (None) is received, the method returns and stops
-        further processing. Additionally, it logs the end of the pipeline execution
-        and sets the provided event to signal completion.
+        with self._output_cond:
+            while True:
+                for idx, output_queue in enumerate(self._output_queues):
+                    if self._outputs_drained[idx]:
+                        continue
+                    try:
+                        head = output_queue.peek()
+                    except Empty:
+                        continue
+                    if head is None:
+                        output_queue.get()
+                        self._outputs_drained[idx] = True
+                        continue
+                    return idx
+
+                # Exit only once every output has terminated, so results still
+                # queued on another output are not discarded.
+                if all(self._outputs_drained):
+                    return None
+
+                self._output_cond.wait(timeout=1.0)
+
+    def retrieve_results(self, event: Event) -> None:
+        """Collect finished queries from the pipeline output queues.
 
         Args:
-            event (Event): An event object used to signal the completion of the pipeline.
+            event (Event): signalled once per completed query, for the
+                schedulers that pace themselves against completions.
         """
-
-        _EMPTY = object()
-
         while True:
-            for output_queue in self._output_queues:
-                # Span every poll so the polling overhead shows up in the
-                # trace. Catch Empty INSIDE the span — an empty queue is
-                # the expected polling case, not an error, and letting it
-                # propagate makes MLflow tag the span as failed.
-                new_query = _EMPTY
-                with mlflow.start_span(
-                    name="pipeline retrieve_results",
-                    attributes={"thread_id": threading.get_ident()},
-                ):
-                    try:
-                        new_query = output_queue.get(timeout=0.1)
-                    except Empty:
-                        pass
+            idx = self._next_result()
+            if idx is None:
+                return                      # every output stage terminated
 
-                if new_query is _EMPTY:
-                    continue
+            # Sole consumer and the queue was peeked non-empty, so this cannot
+            # raise. Done outside _output_cond so it cannot stall a producer.
+            with trace_span(
+                name="pipeline retrieve_results",
+                attributes={"thread_id": threading.get_ident()},
+            ):
+                new_query = self._output_queues[idx].get_nowait()
 
-                # if terminating character is received, return
-                if new_query is None:
-                    return
-
-                # log the end of pipeline execution
+            if not self._disable_logs:
                 self._logger.info(
                     "%s, pipeline - %s, run, end, %d, %.6f, %d, %d",
                     self.name,
@@ -173,20 +219,46 @@ class Pipeline:
                     new_query.batch + 1,
                 )
 
-                with mlflow.start_span(
-                    name="pipeline query processed",
-                    attributes={
-                        "in_flow_id": str(new_query.out_flow_id) if new_query.out_flow_id else None,
-                        "thread_id": threading.get_ident(),
-                        "pipeline": self.name,
-                        "epoch": new_query.epoch,
-                        "split": new_query.split,
-                        "batch": new_query.batch,
-                        "query_id": new_query.query_id,
-                    },
-                ):
+            with trace_span(
+                name="pipeline query processed",
+                attributes=({
+                    "in_flow_id": new_query.out_flow_id,
+                    "thread_id": threading.get_ident(),
+                    "pipeline": self.name,
+                    "epoch": new_query.epoch,
+                    "split": new_query.split,
+                    "batch": new_query.batch,
+                    "query_id": new_query.query_id,
+                } if SPANS_ENABLED else None),
+            ):
+                # Increment under the lock the waiter tests it under.
+                with self._drain_cond:
                     self.queries_processed += 1
-                event.set()
+                    self._drain_cond.notify_all()
+            # The schedulers' wakeup; not signalled while holding _drain_cond.
+            event.set()
+
+    def _wait_for_drain(self, target_processed: int, timeout: float) -> bool:
+        """Block until queries_processed >= target_processed, or timeout.
+
+        Waits on _drain_cond rather than the loadgen Event, which the
+        scheduler also waits on and clears.
+
+        Returns:
+            bool: False if the timeout expired first.
+        """
+        deadline = monotonic() + timeout
+        with self._drain_cond:
+            while self.queries_processed < target_processed:
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    self._logger.warning(
+                        "%s, pipeline, drain, timeout, sent=%d, processed=%d",
+                        self.name, target_processed, self.queries_processed,
+                    )
+                    return False
+                self._drain_cond.wait(remaining)
+        return True
 
     def run(self, query_queue: Queue, event: Event) -> None:
         """
@@ -196,12 +268,11 @@ class Pipeline:
         It continues to process queries until a `None` value is retrieved from the queue, indicating termination.
         Upon termination, it sends a termination signal to subsequent stages and joins all threads.
 
-        If `serialize_queries` is True on the pipeline config, the loop
-        waits for the previous query to exit (queries_processed catches up
-        to queries_sent) before admitting the next one. There is also a
-        bounded wait at shutdown — see DRAIN_TIMEOUT below — so a dropped
-        query never causes an indefinite hang.
+        If `serialize_queries` is set, each query is admitted only after the
+        previous one has left the pipeline. Waits are bounded by
+        PIPELINE_DRAIN_TIMEOUT_S so a dropped query cannot hang the run.
 
+        Args:
             query_queue (Queue): The queue containing queries from the load generator.
             event (Event): An event used for synchronization between the pipeline and the load generator.
         """
@@ -220,89 +291,59 @@ class Pipeline:
         serialize = bool(getattr(self._pipeline_config, "serialize_queries", False))
 
         # Per-query drain budget (s) for serialized mode and for shutdown.
-        # If a query gets dropped mid-pipeline we don't want to deadlock
-        # waiting for queries_processed to catch up forever.
-        DRAIN_TIMEOUT = 600.0
-
-        def _wait_for_drain(target_processed: int, timeout: float) -> bool:
-            """Block until queries_processed >= target_processed or timeout."""
-            from time import monotonic
-            deadline = monotonic() + timeout
-            while self.queries_processed < target_processed:
-                remaining = deadline - monotonic()
-                if remaining <= 0:
-                    self._logger.warning(
-                        "%s, pipeline, drain, timeout, sent=%d, processed=%d",
-                        self.name, queries_sent, self.queries_processed,
-                    )
-                    return False
-                event.wait(min(0.1, remaining))
-                event.clear()
-            return True
+        DRAIN_TIMEOUT = float(os.environ.get("PIPELINE_DRAIN_TIMEOUT_S", "3600"))
 
         while True:
             query: Query | None = query_queue.get()
 
-            # check if done
             if query is None:
-                # Wait for all in-flight queries to finish, but with a bound
-                # so a silently-dropped query (e.g. from a buggy polling
-                # policy or a stage exception) doesn't cause indefinite hang.
-                _wait_for_drain(queries_sent, DRAIN_TIMEOUT)
-
-                # send the termination element to the following stages and join the threads
-                for input_queue in self._input_queues:
-                    input_queue.put(None)
-                # Bounded join — a stuck stage shouldn't hold the whole
-                # pipeline in shutdown. main.py force-exits afterwards,
-                # so leaked threads are reclaimed by process exit.
+                self._wait_for_drain(queries_sent, DRAIN_TIMEOUT)
+                self._broadcast_terminator()
+                # Bounded join; main.py force-exits afterwards.
                 self.join_threads(timeout=10.0)
                 break
 
-            # log the start of pipeline execution for the query
             if query.batch == 0:
                 epoch_dict[query.split] += 1
 
             query.epoch = epoch_dict[query.split]
 
-            self._logger.info(
-                "%s, pipeline - %s, run, start, %d, %.6f, %d, %d",
-                self.name,
-                query.split,
-                query.query_id,
-                query.query_submitted_timestamp,
-                query.epoch,
-                query.batch + 1,
-            )
+            if not self._disable_logs:
+                self._logger.info(
+                    "%s, pipeline - %s, run, start, %d, %.6f, %d, %d",
+                    self.name,
+                    query.split,
+                    query.query_id,
+                    query.query_submitted_timestamp,
+                    query.epoch,
+                    query.batch + 1,
+                )
 
-            out_flow_id = uuid.uuid4()
-            with mlflow.start_span(
-                name="pipeline query",
-                attributes={
+            # No flow id or attribute dict when spans are off.
+            if SPANS_ENABLED:
+                out_flow_id = new_flow_id()
+                attributes = {
+                    # the scheduler hands over a uuid.UUID; downstream ids are str
                     "in_flow_id": str(query.out_flow_id) if query.out_flow_id else None,
-                    "out_flow_id": str(out_flow_id),
+                    "out_flow_id": out_flow_id,
                     "thread_id": threading.get_ident(),
                     "pipeline": self.name,
                     "epoch": query.epoch,
                     "split": query.split,
                     "batch": query.batch,
                     "query_id": query.query_id,
-                },
-            ):
+                }
+            else:
+                out_flow_id, attributes = None, None
+            with trace_span(name="pipeline query", attributes=attributes):
                 query.out_flow_id = out_flow_id
-                # populate the pipeline input queues / start pipeline execution
                 for input_queue in self._input_queues:
                     input_queue.put(query)
 
             queries_sent += 1
 
-            # In serialized mode, wait for THIS query to exit before
-            # admitting the next one. Bounded so a dropped query
-            # surfaces as a warning rather than a hang.
             if serialize:
-                _wait_for_drain(queries_sent, DRAIN_TIMEOUT)
+                self._wait_for_drain(queries_sent, DRAIN_TIMEOUT)
 
-        # Bounded join on the result-retrieval thread too. If the End
-        # stage somehow never delivered its None terminator, we'd otherwise
-        # hang here forever. main.py force-exits to clean up.
+        # Bounded in case an output stage never delivered its terminator.
         result_retrieval_thread.join(timeout=10.0)

@@ -1,3 +1,4 @@
+# LLM generation with MLX on Apple silicon.
 name: "test_mlx_generation"
 listeners:
   - smi
@@ -39,4 +40,3 @@ pipelines:
             name: mlx-community/Qwen3-0.6B-Base-8bit
             gen_kwargs:
               max_tokens: 50
-              # temperature: 0.7

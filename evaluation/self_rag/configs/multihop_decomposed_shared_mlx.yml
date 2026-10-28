@@ -1,0 +1,155 @@
+name: "Self-RAG Decomposed-Shared — 1x4B, 3 calls (multi-hop / HotpotQA, MLX)"
+pipelines:
+  - name: Self-RAG Decomposed-Shared (multi-hop)
+    inputs: [0]
+    outputs: [12]
+    dataset_stage_id: 0
+    loadgen:
+      component: loadgen.PoissonLoadScheduler
+      queue_depth: 110
+      max_queries: 110
+      timeout: 25760
+      config:
+        rate: 0.0217
+    stages:
+      - name: Question dataloader
+        id: 0
+        outputs: [1]
+        component: stages.self_rag.SelfRAGDataLoader
+        config:
+          batch_size: 1
+          dataset:
+            name: hotpotqa/hotpot_qa
+            subset: distractor
+            split: validation
+            question_column: question
+            answers_column: answer
+            offset: 0
+            stride: 120
+
+      - name: Document retriever
+        id: 1
+        outputs: [2]
+        component: stages.self_rag.ChromaRetriever
+        polling_policy: utils.queues.polling.FirstSubmittedPolicy
+        config:
+          corpus_dataset:
+            name: hotpotqa/hotpot_qa
+            subset: distractor
+            split: validation
+            context_column: context
+            context_row_offset: 0
+            context_row_stride: 24
+            max_context_rows: 310
+            max_docs: 20000
+          top_k: 5
+          embedding_model: intfloat/e5-base-v2
+          query_prefix: "query: "
+          passage_prefix: "passage: "
+          collection_name: self_rag_multihop_decomposed_corpus
+
+      - name: Retrieval grader formatter
+        id: 2
+        outputs: [3]
+        component: stages.self_rag.RetrievalGraderFormatter
+        config:
+          tokenizer_stage_id: 3
+
+      - name: Shared LLM (grade)
+        id: 3
+        outputs: [4]
+        component: stages.llm_mlx.Inference
+        config:
+          model:
+            name: mlx-community/Qwen3.5-4B-bf16
+            gen_kwargs:
+              max_tokens: 64
+            thinking_budget: 1024
+
+      - name: Grade router
+        id: 4
+        outputs: [5, 10, 12]
+        component: stages.self_rag.RelevanceFilterRouter
+        config:
+          max_retries: 2
+          yes_stage_id: 5
+          no_stage_id: 10
+          end_stage_id: 12
+          on_exhaust: yes
+
+      - name: Answer generator formatter
+        id: 5
+        outputs: [6]
+        component: stages.self_rag.AnswerGeneratorFormatter
+        polling_policy: utils.queues.polling.FirstSubmittedPolicy
+        config:
+          tokenizer_stage_id: 3
+
+      - name: Shared LLM (generate)
+        id: 6
+        outputs: [7]
+        component: stages.llm_mlx.Inference
+        config:
+          model:
+            name: mlx-community/Qwen3.5-4B-bf16
+            gen_kwargs:
+              max_tokens: 256
+            thinking_budget: 1024
+          depends_on_id: 3
+
+      - name: Hallucination grader formatter
+        id: 7
+        outputs: [8]
+        component: stages.self_rag.HallucinationGraderFormatter
+        config:
+          tokenizer_stage_id: 3
+
+      - name: Shared LLM (hallucination)
+        id: 8
+        outputs: [9]
+        component: stages.llm_mlx.Inference
+        config:
+          model:
+            name: mlx-community/Qwen3.5-4B-bf16
+            gen_kwargs:
+              max_tokens: 16
+            thinking_budget: 1024
+          depends_on_id: 3
+
+      - name: Hallucination router
+        id: 9
+        outputs: [10, 12, 12]
+        component: stages.self_rag.BinaryRouter
+        config:
+          max_retries: 2
+          retry_is_yes: True
+          yes_stage_id: 10
+          no_stage_id: 12
+          end_stage_id: 12
+          on_exhaust: end
+
+      - name: Query rewrite formatter
+        id: 10
+        outputs: [11]
+        component: stages.self_rag.QuestionRewriterFormatter
+        polling_policy: utils.queues.polling.FirstSubmittedPolicy
+        config:
+          tokenizer_stage_id: 3
+          doc_chars: 1500
+
+      - name: Shared LLM (rewrite)
+        id: 11
+        outputs: [1]
+        component: stages.llm_mlx.Inference
+        config:
+          model:
+            name: mlx-community/Qwen3.5-4B-bf16
+            gen_kwargs:
+              max_tokens: 128
+            thinking_budget: 1024
+          depends_on_id: 3
+
+      - name: End stage
+        id: 12
+        component: stages.TerminalCapture
+        polling_policy: utils.queues.polling.FirstSubmittedPolicy

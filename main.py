@@ -4,6 +4,8 @@ import signal
 import sys
 import os
 import logging
+import shutil
+import tempfile
 import time
 
 import radt
@@ -15,16 +17,17 @@ from pydantic import BaseModel
 from multiprocessing import Process, Queue
 from pydantic_yaml import parse_yaml_raw_as
 from typing import Literal
-from utils.logger import Logger, PERF_FORMAT, install_perf_clock, upload_run_outputs
+from utils.logger import Logger, PERF_FORMAT, install_perf_clock
 from loadgen import run_loadgen
 from utils.orchestrator_watchdog import OrchestratorWatchdog
 from utils.schemas import BenchmarkModel
 from utils.server_manager import kill_all as kill_all_servers
 from utils.tracing import configure_async_export, flush_traces
+from utils.trace_span import NAMESPACE as TRACE_NAMESPACE, report_span_count
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Colocation benchmark runner.")
+    parser = argparse.ArgumentParser(description="Gulliver benchmark runner.")
     parser.add_argument(
         "config_file_path",
         type=str,
@@ -35,7 +38,7 @@ def parse_args():
         type=int,
         dest="pipeline_id",
         default=-1,
-        # help="Maximum amount of time to train for (minutes)",
+        help="Run only this pipeline of the config in the current process.",
     )
     parser.add_argument(
         "-e",
@@ -52,15 +55,35 @@ def parse_args():
         help="Override pipeline's serialize_queries flag (true/false).",
     )
     parser.add_argument(
+        "--pipeline-logs",
+        dest="pipeline_logs_override",
+        choices=["on", "off"],
+        default=None,
+        help="Override the pipeline-level per-query CSV rows "
+             "(PipelineModel.disable_logs): 'on' writes them, 'off' suppresses them.",
+    )
+    parser.add_argument(
+        "--max-queries",
+        dest="max_queries_override",
+        type=int,
+        default=None,
+        help="Override the load generator's max_queries.",
+    )
+    parser.add_argument(
         "--label",
         dest="label",
         type=str,
         default=None,
         help="Override the per-run output filename suffix "
-             "(default: pipeline name lowercased). Useful for A/B runs of "
-             "the same config under different settings.",
+             "(default: pipeline name lowercased).",
     )
+    parser.add_argument("--sync-dir", dest="sync_dir", default=None, help=argparse.SUPPRESS)
     return parser.parse_args()
+
+
+def _slug(name: str) -> str:
+    """Pipeline name -> filename-safe token, matching the default label style."""
+    return "".join(c if c.isalnum() else "_" for c in name).strip("_").lower()
 
 
 def convert_listeners(listeners: list[Literal[listeners.keys()]]) -> str:
@@ -68,36 +91,30 @@ def convert_listeners(listeners: list[Literal[listeners.keys()]]) -> str:
 
 
 def radt_entrypoint(args):
-    # Enable ASYNC MLflow span export (radt's bounded background uploader).
-    # Must happen before any mlflow.start_span call (i.e. before importing/
-    # constructing the pipeline) because the flag is read at exporter init.
-    # The overhead drivers still call configure_sync_export explicitly when
-    # they need deterministic per-span cost.
+    # Must run before the first span is created; the flag is read at exporter init.
     configure_async_export()
 
-    # Measurement knob for the framework-overhead microbenchmark: when set, turn
-    # MLflow tracing into a no-op so per-stage spans (3 per stage per query) do
-    # not dominate the measured cost. This isolates the framework's CORE dispatch
-    # (thread wake + queue hand-off + CSV log) from the optional profiling layer.
-    # Unset in all normal runs, so it has no effect on the case studies.
-    if os.environ.get("CHOREO_DISABLE_TRACING", "").lower() in ("1", "true", "yes"):
+    if os.environ.get("SUITE_DISABLE_TRACING", "").lower() in ("1", "true", "yes"):
         mlflow.tracing.disable()
 
-    # Belt-and-braces for the prior "RadT killed the subprocess before MLflow
-    # drained" issue: catch SIGTERM, flush spans, then re-raise so the
-    # default handler still terminates us.
+    # Out-of-process tracing: spans are sent to a radT-owned exporter process.
+    # Started on the main thread, before pipeline threads and CUDA init.
+    if os.environ.get("SUITE_PROC_TRACE", "").lower() in ("1", "true", "yes"):
+        radt.trace.start(experiment_id=args.experiment_id)
+
+    # Forked children (radT listeners) inherit this handler; only the owner flushes.
+    _owner_pid = os.getpid()
+
     def _on_sigterm(signum, frame):  # pylint: disable=unused-argument
-        # Kill any local inference servers first so a RadT timeout/kill can't
-        # leak a vLLM/Ollama subprocess holding the GPU. This is the path that
-        # skips stage post_run(), so it must happen here.
+        if os.getpid() != _owner_pid:
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+            return
         kill_all_servers()
         flush_traces()
-        # Tear down the radt listener/logger children and close the mlflow
-        # run; without this a timeout-killed run stays status=RUNNING forever
-        # and the listener processes only die with the process group. No-op
-        # unless RADT_PRESENT is set. shutdown() end_run()s with the default
-        # FINISHED status, so re-mark the run KILLED afterwards — a validator
-        # matching runs by tag must not mistake a timeout kill for a clean run.
+        report_span_count()
+        radt.trace.shutdown()
+        # Close the run and mark it KILLED so it is not mistaken for a clean run.
         active = mlflow.active_run()
         radt.shutdown()
         if active is not None:
@@ -114,20 +131,27 @@ def radt_entrypoint(args):
         yaml_config = file.read()
         benchmark_config = parse_yaml_raw_as(BenchmarkModel, yaml_config)
 
-        # Apply CLI overrides on the in-memory config.
         pipeline_cfg = benchmark_config.pipelines[args.pipeline_id]
+        # Per-pipeline environment, e.g. an MPS client's SM cap; must precede CUDA init.
+        for _k, _v in pipeline_cfg.env.items():
+            os.environ[_k] = str(_v)
         if args.serialize_override is not None:
             pipeline_cfg.serialize_queries = (args.serialize_override == "true")
+        if args.pipeline_logs_override is not None:
+            pipeline_cfg.disable_logs = (args.pipeline_logs_override == "off")
+        if args.max_queries_override is not None and pipeline_cfg.stop_with is None:
+            pipeline_cfg.loadgen.max_queries = args.max_queries_override
+        stop_marker = None
+        if pipeline_cfg.stop_with is not None and args.sync_dir:
+            stop_marker = os.path.join(args.sync_dir, _slug(pipeline_cfg.stop_with))
 
-        # Configure logging
         default_label = pipeline_cfg.name.replace(" ", "_").lower()
         pipeline_name = args.label if args.label else default_label
-        log_dir = "evaluation/results"
+        log_dir = os.environ.get("SUITE_OUTPUT_DIR", "results")
         os.makedirs(log_dir, exist_ok=True)
         log_file = os.path.join(log_dir, f"{pipeline_name}.csv")
-        # Also expose the chosen label to TerminalCapture via env var so the
-        # JSONL filename matches the CSV filename.
-        os.environ["CHOREO_OUTPUT_LABEL"] = pipeline_name
+        # TerminalCapture names its JSONL after the same label.
+        os.environ["SUITE_OUTPUT_LABEL"] = pipeline_name
 
         install_perf_clock()
         formatter = logging.Formatter(PERF_FORMAT)
@@ -138,8 +162,6 @@ def radt_entrypoint(args):
         logger.setLevel(logging.INFO)
         logger.addHandler(file_handler)
 
-        # Ensure the per-run log handler is flushed and closed even if
-        # the pipeline raises (otherwise the last few log lines are lost).
         import atexit as _atexit
 
         def _cleanup_log_handler():
@@ -152,7 +174,7 @@ def radt_entrypoint(args):
 
         _atexit.register(_cleanup_log_handler)
 
-        # Parse the .yaml and send it over as mlflow params
+        # Flatten the config into mlflow params.
         def build_mlflow_config(
             config: dict, data: BaseModel | list | dict, directory: str
         ) -> None:
@@ -169,22 +191,12 @@ def radt_entrypoint(args):
             else:
                 config[f"{directory}"] = data
 
-        # Route the run to the requested radT experiment BEFORE the first
-        # mlflow call auto-starts a run — without this, -e is honored only on
-        # the schedule path and direct-mode runs land in the Default
-        # experiment. MLFLOW_EXPERIMENT_ID (set by radt for its children)
-        # takes precedence to avoid fighting the orchestrator.
+        # Select the experiment before the first mlflow call starts a run.
+        # MLFLOW_EXPERIMENT_ID, set by radT for its children, takes precedence.
         if "MLFLOW_EXPERIMENT_ID" not in os.environ and args.experiment_id:
             mlflow.set_experiment(experiment_id=str(args.experiment_id))
 
-        # Log config
         mlflow.log_artifact(args.config_file_path, "pipeline")
-
-        # Captured while the run is still open: the log files can only be
-        # uploaded once they are closed, by which point RADTBenchmark.__exit__
-        # has ended the run and the fluent API would start a new one.
-        active_run = mlflow.active_run()
-        log_run_id = active_run.info.run_id if active_run else None
 
         mlflow_config = {}
         build_mlflow_config(
@@ -192,36 +204,26 @@ def radt_entrypoint(args):
         )
         mlflow.log_params(mlflow_config)
 
-    # Enter the radt benchmark context ourselves. On the direct `-p N` path
-    # (evaluation/collect/run_collection.py execs `main.py <cfg> -p 0`) nothing
-    # else enters it, so the macmon/top listener processes never spawn —
-    # _RADTBenchmark.__enter__ (radt/run/benchmark.py) is the ONLY place they
-    # are started, gated on RADT_PRESENT + RADT_LISTENER_<NAME> env vars.
-    # RADTBenchmark is a no-op when RADT_PRESENT is unset (manual runs and the
-    # overhead drivers stay unperturbed), and it wraps a process-wide singleton,
-    # so on the radt-scheduled path (`python -m radt run`, used for the
-    # orchestrated multi-pipeline cells) this reuses the instance already
-    # entered by radt.run.run.start_run instead of double-spawning listeners.
+    # Starts the radT listeners when RADT_PRESENT is set; a no-op otherwise.
     with radt.run.RADTBenchmark():
-        # Tag the run with the per-run output label so post-hoc validation can
-        # match mlflow runs by tag instead of wall clock. The active run exists
-        # by now (mlflow.log_params above auto-starts one even without radt).
-        label = os.environ.get("CHOREO_OUTPUT_LABEL", "")
-        mlflow.set_tag("choreo.label", label)
-        # Descriptive server-side run name: the cell label already encodes
-        # experiment/task/arm/schedule/device/run (e.g.
-        # e4_factoid_monolith_pipe_mlx_r1); append the pipeline name so
-        # multi-pipeline cells stay distinguishable in the UI.
+        label = os.environ.get("SUITE_OUTPUT_LABEL", "")
+        mlflow.set_tag(f"{TRACE_NAMESPACE}.label", label)
+        if os.environ.get("SUITE_PROC_TRACE", "").lower() in ("1", "true", "yes"):
+            _ar = mlflow.active_run()
+            if _ar is not None:
+                radt.trace.set_run(_ar.info.run_id)
         pipe_name = benchmark_config.pipelines[args.pipeline_id].name
         mlflow.set_tag("mlflow.runName",
                        f"{label} | {pipe_name}" if label else pipe_name)
-        run_loadgen(benchmark_config.pipelines[args.pipeline_id])
+        try:
+            run_loadgen(benchmark_config.pipelines[args.pipeline_id], stop_marker)
+        finally:
+            if args.sync_dir:
+                open(os.path.join(args.sync_dir, _slug(pipe_name)), "w").close()
 
-    # Force-exit after the pipeline completes. Interpreter shutdown can
-    # otherwise hang for many minutes on mlflow telemetry sockets in
-    # CLOSE_WAIT, joblib/loky semaphores held by ChromaDB/embedders, and
-    # MLX Metal teardown. We've already captured all results to disk
-    # (timing CSV + TerminalCapture JSONL) so there's nothing left to lose.
+        # Report while the run is still active.
+        report_span_count()
+
     try:
         file_handler.flush()
         file_handler.close()
@@ -229,24 +231,12 @@ def radt_entrypoint(args):
     except Exception:  # pylint: disable=broad-except
         pass
 
-    # Attach whatever this run produced, mirroring the pipeline spec above.
-    # Only radt's scheduler captures these otherwise, so on the direct `-p N`
-    # path they would exist on disk and never reach the server.
-    upload_run_outputs(log_run_id, log_file)
-
-    # Drain MLflow trace spans BEFORE os._exit. atexit handlers don't fire
-    # on os._exit, so this is the last chance to push pending spans.
-    # Run closure: the RADTBenchmark with-block above already terminated the
-    # listeners, flushed their metric queues, and mlflow.end_run()'d (in that
-    # order — see _RADTBenchmark.__exit__ — so no in-flight metric write lands
-    # on a closed run). radt.shutdown() below is the belt-and-braces drain for
-    # any path where the with-block was bypassed; it is idempotent and a no-op
-    # without RADT_PRESENT. Without it, os._exit would leave the run stuck
-    # status=RUNNING and orphan the listener children.
-    # Reap any local inference servers before os._exit (which skips atexit), so
-    # the GPU is freed even if a stage's post_run() didn't run.
+    # Interpreter shutdown can hang on telemetry sockets and backend teardown,
+    # so flush everything explicitly and force-exit.
     kill_all_servers()
     flush_traces()
+    report_span_count()
+    radt.trace.shutdown()
     radt.shutdown()
     os._exit(0)
 
@@ -260,11 +250,7 @@ def main(args):
 
     print("listeners", benchmark_config.listeners)
 
-    # Watchdog: bounded cleanup if radt.schedule_external hangs in its
-    # post-loop HTTPS uploads. See utils/orchestrator_watchdog.py for
-    # the full rationale. Started before schedule_external, notified
-    # immediately after if it returns naturally — daemon thread, so a
-    # clean main() exit kills it automatically.
+    # Bounds cleanup if radt.schedule_external hangs after the runs finish.
     watchdog = OrchestratorWatchdog(
         experiment_id=args.experiment_id,
         parent_name=benchmark_config.name,
@@ -273,11 +259,15 @@ def main(args):
     )
     watchdog.start()
 
-    # initialize a multiprocessing-safe logger
     logger_queue = Queue()
     logger = Logger(logger_queue, benchmark_config.name)
 
-    # build the radt schedule
+    names = {p.name for p in benchmark_config.pipelines}
+    for p in benchmark_config.pipelines:
+        if p.stop_with is not None and p.stop_with not in names:
+            sys.exit(f"stop_with: no pipeline named {p.stop_with!r}")
+    sync_dir = tempfile.mkdtemp(prefix="gulliver-")
+
     pipeline_ids = [i for i in range(len(benchmark_config.pipelines))]
     df_schedule = pd.DataFrame(np.empty(0, dtype=radt.constants.CSV_FORMAT))
     for pipeline_id in pipeline_ids:
@@ -289,29 +279,31 @@ def main(args):
                 "Status": "",
                 "Run": "",
                 "Devices": 0,
-                "Collocation": "",
+                "Collocation": benchmark_config.collocation,
                 "Listeners": convert_listeners(benchmark_config.listeners).lower(),
                 "File": "main.py",
-                # Forward the per-run flags to the inner invocation: radt
-                # re-execs main.py from this Params string, so anything not
-                # carried here (label, serialize override) is silently lost
-                # and the run/CSV falls back to default naming.
-                "Params": f"{args.config_file_path} -p {pipeline_id}"
-                          + (f" --label {args.label}" if args.label else "")
+                # radT re-executes main.py with these params, one process per
+                # pipeline, so CLI overrides and a per-pipeline label go here.
+                "Params": f"{args.config_file_path} -p {pipeline_id} --sync-dir {sync_dir}"
+                          + (f" --label {args.label}_{_slug(benchmark_config.pipelines[pipeline_id].name)}"
+                             if args.label else "")
                           + (f" --serialize {args.serialize_override}"
-                             if args.serialize_override else ""),
+                             if args.serialize_override else "")
+                          + (f" --pipeline-logs {args.pipeline_logs_override}"
+                             if args.pipeline_logs_override else "")
+                          + (f" --max-queries {args.max_queries_override}"
+                             if args.max_queries_override is not None else ""),
             }
         )
 
-    # execute workload
     radt.schedule_external(
         [],
         df_schedule,
         group_name=benchmark_config.name,
     )
     watchdog.notify_schedule_returned()
+    shutil.rmtree(sync_dir, ignore_errors=True)
 
-    # stop the logger
     logger.stop_queue_listener()
 
 
